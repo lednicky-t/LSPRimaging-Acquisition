@@ -27,6 +27,7 @@ against the physical unit yet.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 
 import serial
 
@@ -242,3 +243,36 @@ class VariSpecLctf(IlluminationSource):
         if code:
             self._send_set("R 1")
         return code
+
+
+def discover_varispec_port(candidate_ports: Iterable[str]) -> str | None:
+    """Probe each candidate serial port for a real VariSpec LCTF, returning
+    the first port that responds with a plausible identity - not just "the
+    open() call didn't raise": open() alone doesn't validate anything (a
+    garbled/foreign reply just leaves wavelength_range() as None rather than
+    raising, matching every other driver's "don't be overly strict on
+    connect" philosophy) - real discovery needs the stricter check, since an
+    unknown device on some other candidate port could still open a serial
+    connection successfully without actually being a VariSpec.
+
+    Opens and closes a throwaway driver instance per candidate; the real
+    connection is established separately once a port is chosen (see
+    device/registry.py's driver connect factory) - this function is
+    discovery only, not the final connection. Which ports are safe to try in
+    the first place (not manually pinned to another role, not already
+    claimed by a live connection) is the caller's responsibility - this
+    function only answers "is a VariSpec actually there," not "is it safe to
+    ask."
+    """
+    for port in candidate_ports:
+        driver = VariSpecLctf(port)
+        try:
+            driver.open()
+        except Exception:
+            continue
+        try:
+            if driver.wavelength_range() is not None:
+                return port
+        finally:
+            driver.close()
+    return None

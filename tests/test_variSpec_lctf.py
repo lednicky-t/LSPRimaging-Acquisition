@@ -14,9 +14,10 @@ approach used for the Basler driver's tests.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from lspri_acq_app.device.illumination_base import IlluminationSourceError
-from lspri_acq_app.device.variSpec_lctf import VariSpecLctf
+from lspri_acq_app.device.variSpec_lctf import VariSpecLctf, discover_varispec_port
 
 
 class _FakeVariSpecSerial:
@@ -176,6 +177,42 @@ class InfoParsingTests(unittest.TestCase):
         self.assertEqual(driver._firmware_revision, 117)
         self.assertEqual(driver._serial_number, "52366")
         self.assertIn("52366", driver.device_name())
+
+
+class DiscoverVariSpecPortTests(unittest.TestCase):
+    """discover_varispec_port() is discovery, not the final connection - see
+    its own docstring. Real port-not-found path tested for real (no
+    mocking); the "found a real identity" and "rejected a foreign device"
+    paths need the fake serial port, since there's no physical VariSpec to
+    discover in this environment."""
+
+    def test_no_candidates_returns_none(self) -> None:
+        self.assertIsNone(discover_varispec_port([]))
+
+    def test_nonexistent_port_is_skipped(self) -> None:
+        self.assertIsNone(discover_varispec_port(["COM9999"]))
+
+    def test_finds_the_first_port_with_a_valid_identity(self) -> None:
+        with patch("lspri_acq_app.device.variSpec_lctf.serial.Serial") as mock_serial_cls:
+            fake = _FakeVariSpecSerial()
+            fake.queue_reply(b"117 400.00 720.00 52366\r")  # V ? (inside open()'s _read_info)
+            fake.queue_reply(b"1\r")  # I ? -> already initialized, no I 1 needed
+            mock_serial_cls.return_value = fake
+
+            result = discover_varispec_port(["COM17"])
+
+        self.assertEqual(result, "COM17")
+
+    def test_rejects_a_port_with_no_plausible_identity(self) -> None:
+        with patch("lspri_acq_app.device.variSpec_lctf.serial.Serial") as mock_serial_cls:
+            fake = _FakeVariSpecSerial()
+            fake.queue_reply(b"?\r")  # not a parseable "<rev> <min> <max> <serial>" reply
+            fake.queue_reply(b"0\r")
+            mock_serial_cls.return_value = fake
+
+            result = discover_varispec_port(["COM17"])
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
