@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lspri-acquisition"
+description = "Multispectral imaging (camera + illumination) LSPR acquisition application."
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = [
+    "h5py",
+    "numpy",
+    "PyQt6",
+    "pyqtgraph",
+    "pyserial",
+    "platformdirs",
+    "pypylon",
+    "lspr-ui>=0.1.0",
+    "lspr-core>=0.1.0",
+    "lspr-io>=0.1.0",
+    "lspr-acq-shell>=0.1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[project.scripts]
+lspri-acquisition = "lspri_acq_app.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "lspri_acq_app.__version__"}
