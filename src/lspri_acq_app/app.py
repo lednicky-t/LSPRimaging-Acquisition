@@ -16,6 +16,15 @@ def main() -> None:
     app.setApplicationVersion(__version__)
     apply_base_app_theme(app)
 
+    # Import-time side effect: registers this app's device families (Camera,
+    # and eventually IlluminationSource) into lspr_acq_shell's shared device
+    # lifecycle - see device/registry.py's module docstring. No discovery UI
+    # calls into this yet (that's a later GUI milestone); imported here so
+    # device_family_order() reflects this app's real capabilities as soon as
+    # it starts, matching sLSPR acq's own device_lifecycle shim convention.
+    from lspri_acq_app.device import registry as _device_registry
+    _ = (_device_registry,)
+
     from lspri_acq_app.gui.main_window import MainWindow
 
     window = MainWindow()
