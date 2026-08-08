@@ -73,9 +73,14 @@ class SweepPipelineSmokeTest(unittest.TestCase):
         errors: list[str] = []
         lock = threading.Lock()
 
-        def write_cube(cube):
-            with lock:
-                saved_cubes.append(cube.cube_index)
+        class _RecordingWriter:
+            def write_cube(self, cube) -> int:
+                with lock:
+                    saved_cubes.append(cube.cube_index)
+                return sum(frame.image.nbytes for frame in cube.frames)
+
+            def close(self) -> None:
+                pass
 
         def process_cube(cube):
             def on_result(roi_id, completed_at, result, metric_value):
@@ -88,7 +93,7 @@ class SweepPipelineSmokeTest(unittest.TestCase):
             camera=camera,
             illumination=illumination,
             settings=settings,
-            write_cube=write_cube,
+            writer=_RecordingWriter(),
             process_cube=process_cube,
             on_sweep_error=lambda e: errors.append(e.message),
             on_save_error=lambda e: errors.append(str(e)),

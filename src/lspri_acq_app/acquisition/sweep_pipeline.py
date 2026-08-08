@@ -25,13 +25,18 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import numpy as np
+
 from lspri_acq_app.device.camera_base import Camera, CameraSettings
 from lspri_acq_app.device.illumination_base import IlluminationSource
 from lspri_acq_app.domain.models import Frame, ImagingAcquisitionSettings, SpectralCube
+from lspri_acq_app.storage.image_writer import ImageCubeWriter
 
 _LOGGER = logging.getLogger("lspri_acq_app.sweep_pipeline")
 
@@ -187,27 +192,55 @@ class SweepController:
             self._on_error(error)
 
 
+@dataclass(slots=True, frozen=True)
+class SaveWriterStats:
+    """Live save-lag snapshot - see SaveWriterThread.stats()."""
+
+    queued_now: int
+    avg_write_ms: float
+    max_write_ms: float
+    max_queue_depth_seen: int
+    bytes_written: int
+    cubes_written: int
+
+
 class SaveWriterThread:
     """Dedicated writer thread draining save_queue - must never block the
-    sweep controller or the processing thread. write_cube is the only
-    injection point; the real HDF5-backed writer (storage/image_writer.py,
-    section 9/10 - not built yet) plugs in here. This class owns only the
-    thread/queue lifecycle, matching lspr_acq_shell.AsyncTaggedWriter's own
-    split of "generic plumbing" vs. "what one item actually does."
+    sweep controller or the processing thread. writer (an ImageCubeWriter -
+    storage/image_writer.py's TiffCubeWriter/OmeZarrCubeWriter) is the only
+    injection point. This class owns only the thread/queue lifecycle,
+    matching lspr_acq_shell.AsyncTaggedWriter's own split of "generic
+    plumbing" vs. "what one item actually does."
+
+    Tracks live save-lag metrics (queue depth, write latency, bytes
+    written) using the same pattern already validated in
+    spikes/lspri_acq_phase0/benchmark_ui.py's own SaveWriterThread - rolling
+    write-time window, max-queue-depth-seen, running byte total, all guarded
+    by one lock - so a GUI (or a test) can see, live, whether the chosen
+    storage format/compression/resolution is actually keeping up with
+    acquisition on this specific machine, rather than only finding out after
+    the fact. See the storage-format-benchmark findings for why this matters:
+    the same settings that comfortably keep up at 2x2 binning were measured
+    borderline at full resolution.
     """
 
     def __init__(
         self,
         *,
         save_queue: "queue.Queue[SpectralCube]",
-        write_cube: Callable[[SpectralCube], None],
+        writer: ImageCubeWriter,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self._save_queue = save_queue
-        self._write_cube = write_cube
+        self._writer = writer
         self._on_error = on_error
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._stats_lock = threading.Lock()
+        self._write_times_ms: deque[float] = deque(maxlen=200)
+        self._max_queue_depth_seen = 0
+        self._bytes_written = 0
+        self._cubes_written = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -223,12 +256,29 @@ class SaveWriterThread:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=join_timeout_s)
+        self._writer.close()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def stats(self) -> SaveWriterStats:
+        with self._stats_lock:
+            queued_now = self._save_queue.qsize()
+            avg_ms = float(np.mean(self._write_times_ms)) if self._write_times_ms else 0.0
+            max_ms = float(np.max(self._write_times_ms)) if self._write_times_ms else 0.0
+            return SaveWriterStats(
+                queued_now=queued_now,
+                avg_write_ms=avg_ms,
+                max_write_ms=max_ms,
+                max_queue_depth_seen=self._max_queue_depth_seen,
+                bytes_written=self._bytes_written,
+                cubes_written=self._cubes_written,
+            )
+
     def _run(self) -> None:
         while True:
+            with self._stats_lock:
+                self._max_queue_depth_seen = max(self._max_queue_depth_seen, self._save_queue.qsize())
             try:
                 cube = self._save_queue.get(timeout=0.2)
             except queue.Empty:
@@ -236,7 +286,13 @@ class SaveWriterThread:
                     return
                 continue
             try:
-                self._write_cube(cube)
+                started = time.perf_counter()
+                written_bytes = self._writer.write_cube(cube)
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                with self._stats_lock:
+                    self._write_times_ms.append(elapsed_ms)
+                    self._bytes_written += written_bytes
+                    self._cubes_written += 1
             except Exception as exc:
                 _LOGGER.exception("Save writer failed on cube %d", cube.cube_index)
                 if self._on_error is not None:
@@ -326,7 +382,7 @@ def build_sweep_pipeline(
     camera: Camera,
     illumination: IlluminationSource,
     settings: ImagingAcquisitionSettings,
-    write_cube: Callable[[SpectralCube], None],
+    writer: ImageCubeWriter,
     process_cube: Callable[[SpectralCube], None],
     on_sweep_error: Callable[[SweepError], None] | None = None,
     on_save_error: Callable[[Exception], None] | None = None,
@@ -343,7 +399,7 @@ def build_sweep_pipeline(
         processing_queue=processing_queue,
         on_error=on_sweep_error,
     )
-    save_writer = SaveWriterThread(save_queue=save_queue, write_cube=write_cube, on_error=on_save_error)
+    save_writer = SaveWriterThread(save_queue=save_queue, writer=writer, on_error=on_save_error)
     processing = ProcessingThread(
         processing_queue=processing_queue, process_cube=process_cube, on_error=on_processing_error
     )
