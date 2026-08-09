@@ -108,18 +108,36 @@ and editing controller, comparable to Tier 2's own size):
   `lspri_acq_settings.json` (not sLSPR acq's `lspr_settings.json`). The
   plan itself is deliberately NOT persisted this way - it's project/session
   state, not a UI setting, same distinction sLSPR acq makes.
+- Real import/export landed 2026-08-09, using the already-shared
+  `lspr_acq_shell.experiment_control_import`/`_export` (Tier 0) directly -
+  `ExperimentPlanImportTask`/`ExperimentPlanExportTask` do the actual file
+  I/O off the GUI thread; this window only builds/consumes their payloads.
+  Export is native YAML only (`_build_native_experiment_plan_document`,
+  field-for-field the same schema as sLSPR acq's own, so plans exported
+  from either app open in the other) - sLSPR acq's legacy compat CSV/TXT
+  export formats (25-column layouts for external tool interop) are
+  deliberately not built here. Import accepts native YAML, CSV/TSV, and
+  HDF5 (all three "just work" since `ExperimentPlanImportTask` itself
+  dispatches by file suffix - no extra code needed for HDF5 support beyond
+  what CSV/YAML already required) - imported colors and tube diameters are
+  merged in and persisted; imported valve-label/switch-solution overrides
+  are not (sLSPR acq's importer does merge those; skipped here as a further
+  simplification, since nothing exercises that path without real HDF5
+  measurement files from this app to import from anyway).
 - Still to come, in later sessions: the real
   `flow_plan_model.ExperimentPlanTableModel` + its 8 delegates (replacing
-  the lean `PlanTableModel` above), real import/export file I/O.
+  the lean `PlanTableModel` above).
 """
 
 from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import QSize, Qt, QThreadPool, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -129,6 +147,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
@@ -155,6 +174,12 @@ from lspr_acq_shell.experiment_control_builders import (
     create_flow_step_action_button,
     set_direction_button,
     set_step_valve_button_state_for_button,
+)
+from lspr_acq_shell.experiment_control_export import ExperimentPlanExportData, ExperimentPlanExportTask
+from lspr_acq_shell.experiment_control_import import (
+    ExperimentPlanImportData,
+    ExperimentPlanImportTask,
+    build_experiment_plan_steps_from_import_data,
 )
 from lspr_acq_shell.experiment_control_run_loop import PlanRunLoopMixin
 from lspr_acq_shell.experiment_control_step_decision import StepCommandContext, plan_step_commands
@@ -226,6 +251,8 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._paused_plan_step: PumpPlanStep | None = None
         self._pending_experiment_control_start_after_recording: tuple[bool, int | None] | None = None
         self._step_apply_inflight = 0
+        self._experiment_plan_export_generation = 0
+        self._experiment_plan_import_generation = 0
 
         self._plan_timer = QTimer(self)
         self._plan_timer.setSingleShot(True)
@@ -707,14 +734,150 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             """ % palette
         )
 
-    def _on_import_plan_clicked(self) -> None:
-        # Not yet wired - real CSV/native-plan file import is a later
-        # increment of the visual-parity effort (see module docstring).
-        self._set_status_message("Import is not implemented in this app yet.")
+    def _build_native_experiment_plan_document(self) -> dict[str, object]:
+        """Native YAML export schema - matches sLSPR acq's
+        `_build_native_experiment_plan_document` field-for-field, so a plan
+        exported from either app opens correctly in the other. Its legacy
+        compat CSV/TXT export formats (25-column layouts for external tool
+        interop, not core functionality) are deliberately not built here -
+        native YAML is this app's own primary format too.
+        """
+        steps = recompute_plan_timing(self._read_experiment_control_steps())
+        tube_mm_by_channel = [spin.value() for spin in self.tube_diameter_spins]
+        return {
+            "format": {"name": "LSPR Experiment Plan", "version": 1},
+            "metadata": {
+                "created_by": "LSPRimaging Acquisition",
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "notes": "",
+            },
+            "units": {"flow": "uL/min", "time": "s", "tube_diameter": "mm"},
+            "devices": {
+                "pumps": {
+                    "pump_1": {
+                        "label": "Pump 1",
+                        "channels": {
+                            f"ch{channel_index}": {
+                                "label": f"CH{channel_index}",
+                                "tube_mm": float(tube_mm_by_channel[channel_index - 1]),
+                            }
+                            for channel_index in range(1, ACTIVE_PUMP_CHANNELS + 1)
+                        },
+                    }
+                },
+                "valves": {
+                    "valve_1": {
+                        "display_labels": {
+                            "open": self._valve_state_label("Open"),
+                            "close": self._valve_state_label("Close"),
+                        },
+                    }
+                },
+                "switches": {
+                    "switch_1": {"ports": {position: self._switch_solution_label(position) for position in range(1, 13)}}
+                },
+            },
+            "steps": [
+                {
+                    "id": step.step,
+                    "duration_s": float(step.duration_s),
+                    "color": str(step.color or self._default_experiment_control_color(step.step - 1)),
+                    "comment": str(step.description or ""),
+                    "devices": {
+                        "pump_1": {
+                            f"ch{channel_index + 1}": {
+                                "flow": float(step.channels[channel_index].flow_ul_min),
+                                "direction": str(step.channels[channel_index].direction or "OFF"),
+                            }
+                            for channel_index in range(ACTIVE_PUMP_CHANNELS)
+                        },
+                        "valve_1": {"state": "close" if str(step.valve or "").strip().lower() == "close" else "open"},
+                        "switch_1": {"port": int(max(min(int(step.switch_position), 12), 1))},
+                    },
+                }
+                for step in steps
+            ],
+        }
 
     def _on_export_plan_clicked(self) -> None:
-        # Not yet wired - see _on_import_plan_clicked.
-        self._set_status_message("Export is not implemented in this app yet.")
+        steps = self._read_experiment_control_steps()
+        if not steps:
+            self._set_status_message("There is no experiment plan to export.")
+            return
+        file_path, _selected_filter = QFileDialog.getSaveFileName(
+            self, "Export experiment plan", "experiment_plan.flow.yaml",
+            "Native YAML (*.flow.yaml *.yaml *.yml);;All files (*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        if not path.suffix:
+            path = path.with_suffix(".flow.yaml")
+        self._experiment_plan_export_generation += 1
+        generation = self._experiment_plan_export_generation
+        task = ExperimentPlanExportTask(generation, ExperimentPlanExportData(
+            path=path, document=self._build_native_experiment_plan_document(),
+        ))
+        task.signals.finished.connect(self._on_experiment_plan_export_finished)
+        task.signals.failed.connect(self._on_experiment_plan_export_failed)
+        self._set_status_message(f"Exporting experiment plan to {path.name}...")
+        QThreadPool.globalInstance().start(task)
+
+    def _on_experiment_plan_export_finished(self, generation: int, payload: object) -> None:
+        if generation != self._experiment_plan_export_generation or not isinstance(payload, ExperimentPlanExportData):
+            return
+        self._set_status_message(f"Exported experiment plan to {payload.path.name}.")
+
+    def _on_experiment_plan_export_failed(self, generation: int, message: str) -> None:
+        if generation != self._experiment_plan_export_generation:
+            return
+        self._set_status_message(f"Could not export experiment plan: {message}")
+
+    def _on_import_plan_clicked(self) -> None:
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self, "Import experiment plan", "",
+            "Experiment plan files (*.flow.yaml *.yaml *.yml *.csv *.txt *.h5 *.hdf5);;All files (*)",
+        )
+        if not file_path:
+            return
+        self._experiment_plan_import_generation += 1
+        generation = self._experiment_plan_import_generation
+        task = ExperimentPlanImportTask(generation, Path(file_path))
+        task.signals.finished.connect(self._on_experiment_plan_import_finished)
+        task.signals.failed.connect(self._on_experiment_plan_import_failed)
+        self._set_status_message(f"Importing experiment plan from {Path(file_path).name}...")
+        QThreadPool.globalInstance().start(task)
+
+    def _on_experiment_plan_import_finished(self, generation: int, payload: object) -> None:
+        if generation != self._experiment_plan_import_generation or not isinstance(payload, ExperimentPlanImportData):
+            return
+        steps = payload.steps
+        if steps is None:
+            steps = build_experiment_plan_steps_from_import_data(payload, l_is_open=True)
+        if not steps:
+            self._set_status_message(f"No steps found in {payload.path.name}.")
+            return
+        self._table_model.set_steps(recompute_plan_timing(steps))
+        self.plan_table.selectRow(0)
+        if payload.imported_colors:
+            existing = {color for _name, color in self._color_palette_entries}
+            for color in payload.imported_colors:
+                if color not in existing:
+                    self._color_palette_entries.append((color, color))
+                    existing.add(color)
+            self._populate_color_combo(self.step_color_combo)
+        if payload.tube_mm_by_channel:
+            for index, spin in enumerate(self.tube_diameter_spins):
+                if index < len(payload.tube_mm_by_channel):
+                    spin.setValue(float(payload.tube_mm_by_channel[index]))
+        self._save_experiment_control_settings()
+        self._sync_experiment_control_timeline(self._read_experiment_control_steps(), None)
+        self._set_status_message(f"Imported experiment plan from {payload.path.name}.")
+
+    def _on_experiment_plan_import_failed(self, generation: int, message: str) -> None:
+        if generation != self._experiment_plan_import_generation:
+            return
+        self._set_status_message(f"Could not import experiment plan: {message}")
 
     # ═══════════════════════════════════════════════════════════════════
     # PlanRunLoopMixin host contract

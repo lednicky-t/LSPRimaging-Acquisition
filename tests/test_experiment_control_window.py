@@ -657,5 +657,132 @@ class SettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(len(window._color_palette_entries), len(PLAN_COLOR_OPTIONS))
 
 
+def _drain_thread_pool() -> None:
+    from PyQt6.QtCore import QThreadPool
+
+    QThreadPool.globalInstance().waitForDone(2000)
+    for _ in range(5):
+        QApplication.processEvents()
+
+
+class ImportExportTests(unittest.TestCase):
+    """Real ExperimentPlanImportTask/ExperimentPlanExportTask dispatched onto
+    the real QThreadPool.globalInstance() and drained, not mocked - proves
+    an actual round trip through real file I/O, using tempfile paths so
+    nothing touches real user files. QFileDialog is patched only for the
+    path it returns (not the import/export logic itself)."""
+
+    def setUp(self) -> None:
+        self.window = _make_window(self)
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.tmp_dir = Path(tmp_dir.name)
+
+    def test_export_writes_a_real_yaml_file(self) -> None:
+        export_path = self.tmp_dir / "plan.flow.yaml"
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getSaveFileName", return_value=(str(export_path), "")):
+            self.window._on_export_plan_clicked()
+            _drain_thread_pool()
+
+        self.assertTrue(export_path.exists())
+        content = export_path.read_text(encoding="utf-8")
+        self.assertIn("steps:", content)
+        self.assertIn("format:", content)
+
+    def test_export_with_no_steps_does_not_write_a_file(self) -> None:
+        self.window.plan_table.selectRow(0)
+        self.window._on_delete_step_clicked()
+        self.assertEqual(len(self.window._read_experiment_control_steps()), 0)
+
+        export_path = self.tmp_dir / "plan.flow.yaml"
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getSaveFileName", return_value=(str(export_path), "")):
+            self.window._on_export_plan_clicked()
+            _drain_thread_pool()
+
+        self.assertFalse(export_path.exists())
+
+    def test_round_trip_export_then_import_preserves_step_values(self) -> None:
+        self.window.step_duration_spin.setValue(77.0)
+        self.window.step_comment_edit.setText("round-trip comment")
+        self.window.manual_flow_spins[2].setValue(55.0)
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()
+
+        export_path = self.tmp_dir / "plan.flow.yaml"
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getSaveFileName", return_value=(str(export_path), "")):
+            self.window._on_export_plan_clicked()
+            _drain_thread_pool()
+
+        second = _make_window(self)
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getOpenFileName", return_value=(str(export_path), "")):
+            second._on_import_plan_clicked()
+            _drain_thread_pool()
+
+        imported_steps = second._read_experiment_control_steps()
+        self.assertEqual(len(imported_steps), 2)
+        self.assertEqual(imported_steps[1].duration_s, 77.0)
+        self.assertEqual(imported_steps[1].description, "round-trip comment")
+        self.assertEqual(imported_steps[1].channels[2].flow_ul_min, 55.0)
+
+    def test_import_merges_new_colors_into_the_palette(self) -> None:
+        yaml_path = self.tmp_dir / "plan.flow.yaml"
+        yaml_path.write_text(
+            "format:\n  name: LSPR Experiment Plan\n  version: 1\n"
+            "steps:\n"
+            "  - id: 1\n"
+            "    duration_s: 10.0\n"
+            "    color: '#123456'\n"
+            "    comment: ''\n"
+            "    devices:\n"
+            "      pump_1: {}\n"
+            "      valve_1: {state: open}\n"
+            "      switch_1: {port: 1}\n",
+            encoding="utf-8",
+        )
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getOpenFileName", return_value=(str(yaml_path), "")):
+            self.window._on_import_plan_clicked()
+            _drain_thread_pool()
+
+        colors = {color for _name, color in self.window._color_palette_entries}
+        self.assertIn("#123456", colors)
+
+    def test_import_updates_tube_diameters(self) -> None:
+        distinct_mm = [option.mm for option in TUBE_DIAMETER_OPTIONS if option.mm != DEFAULT_TUBE_MM][0]
+        yaml_path = self.tmp_dir / "plan.flow.yaml"
+        yaml_path.write_text(
+            "format:\n  name: LSPR Experiment Plan\n  version: 1\n"
+            "devices:\n"
+            f"  pumps:\n    pump_1:\n      channels:\n        ch1: {{tube_mm: {distinct_mm}}}\n"
+            "steps:\n"
+            "  - id: 1\n    duration_s: 10.0\n    color: '#4E79A7'\n    comment: ''\n"
+            "    devices:\n      pump_1: {}\n      valve_1: {state: open}\n      switch_1: {port: 1}\n",
+            encoding="utf-8",
+        )
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getOpenFileName", return_value=(str(yaml_path), "")):
+            self.window._on_import_plan_clicked()
+            _drain_thread_pool()
+
+        self.assertEqual(self.window.tube_diameter_spins[0].value(), distinct_mm)
+
+    def test_import_of_a_nonexistent_file_reports_status_without_raising(self) -> None:
+        missing_path = self.tmp_dir / "does_not_exist.flow.yaml"
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getOpenFileName", return_value=(str(missing_path), "")):
+            self.window._on_import_plan_clicked()  # must not raise
+            _drain_thread_pool()
+
+        self.assertIn("Could not import", self.window.status_label.text())
+
+    def test_cancelling_the_export_dialog_does_nothing(self) -> None:
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getSaveFileName", return_value=("", "")):
+            self.window._on_export_plan_clicked()  # must not raise
+            _drain_thread_pool()
+
+    def test_cancelling_the_import_dialog_does_nothing(self) -> None:
+        with patch("lspri_acq_app.gui.experiment_control_window.QFileDialog.getOpenFileName", return_value=("", "")):
+            self.window._on_import_plan_clicked()  # must not raise
+            _drain_thread_pool()
+        self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
