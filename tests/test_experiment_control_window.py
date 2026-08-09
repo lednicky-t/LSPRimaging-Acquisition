@@ -784,5 +784,41 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
 
 
+class PlanTableDelegateWiringTests(unittest.TestCase):
+    """Confirms the real plan_table/pause_template_table (not a bare
+    PlanTableModel/delegate pair) actually got the real delegates
+    installed - the delegate behavior itself is covered directly in
+    test_plan_table_model.py."""
+
+    def setUp(self) -> None:
+        self.window = _make_window(self)
+
+    def test_plan_table_has_real_delegates_not_the_default_one(self) -> None:
+        from lspri_acq_app.gui.plan_table_model import COLUMN_SWITCH, COLUMN_VALVE, SwitchSolutionDelegate, ValveDelegate
+
+        self.assertIsInstance(self.window.plan_table.itemDelegateForColumn(COLUMN_VALVE), ValveDelegate)
+        self.assertIsInstance(self.window.plan_table.itemDelegateForColumn(COLUMN_SWITCH), SwitchSolutionDelegate)
+
+    def test_pause_template_table_also_has_real_delegates(self) -> None:
+        from lspri_acq_app.gui.plan_table_model import COLUMN_VALVE, ValveDelegate
+
+        self.assertIsInstance(self.window.pause_template_table.itemDelegateForColumn(COLUMN_VALVE), ValveDelegate)
+
+    def test_valve_delegate_display_text_reflects_a_custom_label(self) -> None:
+        from lspri_acq_app.gui.plan_table_model import COLUMN_VALVE
+
+        def _exec(dialog_self):
+            dialog_self.findChildren(QLineEdit)[0].setText("Loaded")
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_valve_state_labels()
+
+        delegate = self.window.plan_table.itemDelegateForColumn(COLUMN_VALVE)
+        index = self.window._table_model.index(0, COLUMN_VALVE)
+        text = delegate.displayText(index.data(Qt.ItemDataRole.DisplayRole), None)
+        self.assertEqual(text, "Loaded")
+
+
 if __name__ == "__main__":
     unittest.main()

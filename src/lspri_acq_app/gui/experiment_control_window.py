@@ -124,9 +124,24 @@ and editing controller, comparable to Tier 2's own size):
   are not (sLSPR acq's importer does merge those; skipped here as a further
   simplification, since nothing exercises that path without real HDF5
   measurement files from this app to import from anyway).
-- Still to come, in later sessions: the real
-  `flow_plan_model.ExperimentPlanTableModel` + its 8 delegates (replacing
-  the lean `PlanTableModel` above).
+- Real per-cell delegates landed 2026-08-09, closing the last item from the
+  visual-parity punch list - but not by porting sLSPR acq's
+  `flow_plan_model.ExperimentPlanTableModel` + its 8 delegate classes.
+  Traced that file first: the *model* class there takes no `window`
+  reference at all (configured via plain setters), so it's genuinely
+  portable - but this window's own `gui.plan_table_model.PlanTableModel`
+  already has 58+ tests built around its own (different) column layout, so
+  swapping in the real model would have meant reworking column indices and
+  delegate wiring across already-working, tested code for uncertain
+  benefit. The actual complexity is entirely in the 8 delegates, which
+  *are* deeply `window`-coupled (event filters, wheel-scroll suppression,
+  auto-opening popups, exact popup-width calculations). Built 3 lean, real
+  delegates instead (`ValveDelegate`/`SwitchSolutionDelegate`/
+  `DirectionDelegate` in `gui/plan_table_model.py`) from pieces already in
+  this window (`_valve_state_label`, `_switch_display_text`,
+  `direction_glyph`) - real dropdown editors and `displayText()` overrides
+  for friendly read-only rendering, no custom popup sizing/wheel-scroll/
+  auto-open behavior. `PlanColorDelegate` (Tier 1) was already wired.
 """
 
 from __future__ import annotations
@@ -190,7 +205,16 @@ from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PLAN_COLOR_OPTIONS, P
 from lspr_acq_shell.settings_store import load_app_setting, save_app_setting
 from lspr_acq_shell.user_profile import current_config_path
 
-from lspri_acq_app.gui.plan_table_model import PlanTableModel
+from lspri_acq_app.gui.plan_table_model import (
+    COLUMN_CHANNEL_DIRECTION_START,
+    COLUMN_COLOR,
+    COLUMN_SWITCH,
+    COLUMN_VALVE,
+    DirectionDelegate,
+    PlanTableModel,
+    SwitchSolutionDelegate,
+    ValveDelegate,
+)
 
 _LOGGER = logging.getLogger("lspri_acq_app.experiment_control")
 
@@ -199,8 +223,6 @@ _LOGGER = logging.getLogger("lspri_acq_app.experiment_control")
 # (lspr_acq_shell.user_profile.current_config_path), matching the pattern
 # lspr_acq_shell.settings_store's own module docstring recommends.
 _SETTINGS_FILENAME = "lspri_acq_settings.json"
-
-_COLOR_COLUMN = 4 + 2 * ACTIVE_PUMP_CHANNELS  # matches plan_table_model's layout
 
 
 class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
@@ -418,7 +440,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self.plan_table = ExperimentControlTableView(self)
         self.plan_table.setModel(self._table_model)
         self.plan_table.setProperty("experiment_control_edit_mode", True)
-        self.plan_table.setItemDelegateForColumn(_COLOR_COLUMN, PlanColorDelegate(self.plan_table))
+        self._install_plan_table_delegates(self.plan_table)
         self.plan_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.plan_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.plan_table.step_move_requested.connect(self._on_step_move_requested)
@@ -451,7 +473,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self.pause_template_table = ExperimentControlTableView(self)
         self.pause_template_table.setModel(self._pause_template_model)
         self.pause_template_table.setProperty("experiment_control_edit_mode", True)
-        self.pause_template_table.setItemDelegateForColumn(_COLOR_COLUMN, PlanColorDelegate(self.pause_template_table))
+        self._install_plan_table_delegates(self.pause_template_table)
         self.pause_template_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.pause_template_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.pause_template_table.setFixedHeight(64)
@@ -1032,6 +1054,19 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
 
     def _run_gui_callback_timed(self, label: str, callback: Callable[[], None]) -> None:
         callback()
+
+    def _install_plan_table_delegates(self, table: ExperimentControlTableView) -> None:
+        """Real per-cell delegates (dropdown pickers, not plain text entry)
+        for the plan table and the pause-template table - both use the same
+        `PlanTableModel` column layout. See this module's `plan_table_model`
+        import and that file's docstring for why these are lean equivalents
+        of sLSPR acq's delegates, not ports of them."""
+        table.setItemDelegateForColumn(COLUMN_VALVE, ValveDelegate(self, table))
+        table.setItemDelegateForColumn(COLUMN_SWITCH, SwitchSolutionDelegate(self, table))
+        direction_delegate = DirectionDelegate(table)
+        for channel_index in range(ACTIVE_PUMP_CHANNELS):
+            table.setItemDelegateForColumn(COLUMN_CHANNEL_DIRECTION_START + channel_index, direction_delegate)
+        table.setItemDelegateForColumn(COLUMN_COLOR, PlanColorDelegate(table))
 
     # ═══════════════════════════════════════════════════════════════════
     # Settings persistence
