@@ -1,6 +1,9 @@
 """Main window.
 
-Assembles the ROI/image-view panel (gui/roi_panel.py) and the
+Assembles the ROI/image-view panel (gui/roi_panel.py), the illumination/
+camera per-wavelength settings panel (gui/illumination_camera_settings_panel.py,
+2026-08-09 - the first piece of the session-recording workflow with a real
+GUI; see that module's docstring for what's v1-scoped vs. deferred), and the
 pump/valve/selector experiment-control panel (gui/experiment_control_window.py,
 reused from lspr_acq_shell - see that module's docstring for what's shared
 vs. simplified in this first working version). Real camera/illumination
@@ -8,7 +11,8 @@ device wiring and a sweep-pipeline "start experiment" flow that ties the
 image acquisition to the experiment-control plan are later milestones (see
 the architecture plan's section 12 delivery checklist), not built here yet -
 this window currently runs the pump/valve/selector plan and the camera
-preview as two independent panels, not yet synchronized.
+preview as independent panels, not yet synchronized, and the settings panel
+doesn't drive a running sweep yet either.
 
 Shows one real (simulated) frame at startup so the ROI panel isn't an empty
 box - SimulatedCamera is an already-tested v1 code path, not a shortcut
@@ -28,6 +32,7 @@ from lspri_acq_app import __version__
 from lspri_acq_app.device.camera_base import CameraSettings
 from lspri_acq_app.device.simulated_camera import SimulatedCamera
 from lspri_acq_app.gui.experiment_control_window import ExperimentControlWindow
+from lspri_acq_app.gui.illumination_camera_settings_panel import IlluminationCameraSettingsPanel
 from lspri_acq_app.gui.roi_panel import RoiPanel
 from lspri_acq_app.version import APP_NAME
 
@@ -43,13 +48,16 @@ class MainWindow(QWidget):
         header.setStyleSheet("font-size: 14px; font-weight: 600; padding: 4px 0px;")
 
         self.roi_panel = RoiPanel(self)
+        self.illumination_camera_settings_panel = IlluminationCameraSettingsPanel(self)
         self.experiment_control_window = ExperimentControlWindow(self)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self.roi_panel)
+        splitter.addWidget(self.illumination_camera_settings_panel)
         splitter.addWidget(self.experiment_control_window)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(12, 12, 12, 12)
