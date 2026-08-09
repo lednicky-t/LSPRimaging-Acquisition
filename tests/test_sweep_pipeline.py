@@ -199,7 +199,6 @@ class PerWavelengthOverrideTests(unittest.TestCase):
         self.assertEqual(configure_calls[1].binning, 2)
 
     def test_settle_time_override_is_used_for_its_specific_wavelength_only(self) -> None:
-        waits: list[float] = []
         camera = SimulatedCamera()
         camera.open()
 

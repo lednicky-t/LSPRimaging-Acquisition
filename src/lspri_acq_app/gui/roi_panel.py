@@ -144,6 +144,15 @@ class RoiPanel(QWidget):
         self._refresh_list()
         self._notify_changed()
 
+    def load_rois(self, rois: list[AreaRoi]) -> None:
+        """Replace every current ROI with the given list - e.g. after a
+        session restore (storage/hdf5_export.py's read_imaging_session())."""
+        for roi_id in list(self._rois.keys()):
+            self.remove_roi(roi_id)
+        for roi in rois:
+            self._add_roi_object(roi)
+        self._notify_changed()
+
     # -- internal: building/syncing overlay items --------------------------------
 
     def _add_roi_object(self, roi: AreaRoi) -> None:

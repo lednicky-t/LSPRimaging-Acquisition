@@ -1090,6 +1090,47 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         )
 
     # ═══════════════════════════════════════════════════════════════════
+    # Public API - assignment-table state for session save/restore
+    # (2026-08-09: storage/hdf5_export.py's ImagingMeasurementWriter needs
+    # this window's valve/switch/color-palette state to satisfy the
+    # maintainer's requested compatibility with the existing measurement
+    # schema's assignment tables; this is the read/write seam for that,
+    # kept separate from _save_experiment_control_settings's own JSON
+    # persistence, which is this window's independent per-user settings
+    # file, not a session file.)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def assignment_table_state(self) -> dict[str, object]:
+        return {
+            "valve_state_labels": dict(self._valve_state_labels),
+            "valve_state_colors": dict(self._valve_state_colors),
+            "color_palette_entries": list(self._color_palette_entries),
+            "switch_solution_labels": list(self._switch_solution_labels),
+        }
+
+    def apply_assignment_table_state(
+        self,
+        *,
+        valve_state_labels: dict[str, str] | None = None,
+        valve_state_colors: dict[str, str] | None = None,
+        color_palette_entries: list[tuple[str, str]] | None = None,
+        switch_solution_labels: list[str] | None = None,
+    ) -> None:
+        if valve_state_labels is not None:
+            self._valve_state_labels = dict(valve_state_labels)
+        if valve_state_colors is not None:
+            self._valve_state_colors = dict(valve_state_colors)
+        if color_palette_entries is not None:
+            self._color_palette_entries = list(color_palette_entries)
+            self._populate_color_combo(self.step_color_combo)
+        if switch_solution_labels is not None:
+            padded = [str(label) for label in switch_solution_labels[:12]]
+            padded += [""] * max(0, 12 - len(padded))
+            self._switch_solution_labels = padded
+            self._populate_switch_solution_combo(self.step_switch_combo, self.step_switch_combo.currentData())
+        self._save_experiment_control_settings()
+
+    # ═══════════════════════════════════════════════════════════════════
     # Toolbar actions
     # ═══════════════════════════════════════════════════════════════════
 

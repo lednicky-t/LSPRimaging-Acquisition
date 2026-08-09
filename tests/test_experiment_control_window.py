@@ -820,5 +820,56 @@ class PlanTableDelegateWiringTests(unittest.TestCase):
         self.assertEqual(text, "Loaded")
 
 
+class AssignmentTableStateTests(unittest.TestCase):
+    """assignment_table_state()/apply_assignment_table_state() - the
+    2026-08-09 public seam storage/hdf5_export.py's ImagingMeasurementWriter
+    uses to read/restore this window's valve/switch/color-palette state for
+    session save/load, kept separate from _save_experiment_control_settings'
+    own per-user JSON persistence."""
+
+    def setUp(self) -> None:
+        self.window = _make_window(self)
+
+    def test_state_reflects_current_defaults(self) -> None:
+        state = self.window.assignment_table_state()
+        self.assertEqual(state["valve_state_labels"]["Open"], "Open")
+        self.assertEqual(len(state["switch_solution_labels"]), 12)
+        self.assertEqual(state["color_palette_entries"], list(PLAN_COLOR_OPTIONS))
+
+    def test_apply_valve_labels_updates_state_and_combo_source(self) -> None:
+        self.window.apply_assignment_table_state(
+            valve_state_labels={"Open": "Loaded", "Close": "Waste"},
+            valve_state_colors={"Open": "#123456"},
+        )
+        self.assertEqual(self.window._valve_state_label("Open"), "Loaded")
+        self.assertEqual(self.window.assignment_table_state()["valve_state_colors"]["Open"], "#123456")
+
+    def test_apply_color_palette_repopulates_the_combo(self) -> None:
+        self.window.apply_assignment_table_state(color_palette_entries=[("Blue", "#0000FF")])
+        self.assertEqual(self.window.step_color_combo.count(), 1)
+        self.assertEqual(self.window.step_color_combo.itemText(0), "Blue")
+
+    def test_apply_switch_solution_labels_updates_display_text(self) -> None:
+        self.window.apply_assignment_table_state(switch_solution_labels=["Buffer A"])
+        self.assertEqual(self.window._switch_display_text(1), "1: Buffer A")
+
+    def test_apply_state_persists_to_settings(self) -> None:
+        with patch.object(type(self.window), "_save_experiment_control_settings") as save_mock:
+            self.window.apply_assignment_table_state(color_palette_entries=[("Blue", "#0000FF")])
+        save_mock.assert_called_once()
+
+    def test_round_trip_through_state_dict(self) -> None:
+        self.window.apply_assignment_table_state(
+            valve_state_labels={"Open": "Loaded", "Close": "Waste"},
+            color_palette_entries=[("Blue", "#0000FF")],
+            switch_solution_labels=["Buffer A", "", "Buffer C"],
+        )
+        state = self.window.assignment_table_state()
+
+        other = _make_window(self)
+        other.apply_assignment_table_state(**state)
+        self.assertEqual(other.assignment_table_state(), state)
+
+
 if __name__ == "__main__":
     unittest.main()

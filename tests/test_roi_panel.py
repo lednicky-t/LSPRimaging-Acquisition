@@ -14,6 +14,7 @@ import unittest
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 
+from lspri_acq_app.domain.roi import AreaRoi
 from lspri_acq_app.gui.roi_panel import RoiPanel
 
 _APP = QApplication.instance() or QApplication([])
@@ -141,6 +142,41 @@ class RoiPanelReferenceEditTests(unittest.TestCase):
         self.panel._reference_inner_spin.setValue(40.0)
         self.panel._reference_outer_spin.setValue(20.0)
         self.assertGreaterEqual(self.roi.reference_outer_diameter_px, self.roi.reference_inner_diameter_px)
+
+
+class LoadRoisTests(unittest.TestCase):
+    """load_rois() - 2026-08-09, the session-restore counterpart to
+    add_roi(): replaces every current ROI with a given (possibly
+    fully-specified, e.g. from read_imaging_session()) list."""
+
+    def setUp(self) -> None:
+        self.panel = RoiPanel()
+        self.addCleanup(_close_and_flush, self.panel)
+        self.panel.set_image_shape((200, 300))
+
+    def test_replaces_existing_rois(self) -> None:
+        self.panel.add_roi(10.0, 10.0)
+        self.panel.load_rois(
+            [AreaRoi(area_roi_id=5, center_x=50.0, center_y=60.0, sample_radius_px=8.0)]
+        )
+        self.assertEqual([r.area_roi_id for r in self.panel.rois()], [5])
+        self.assertEqual((self.panel.rois()[0].center_x, self.panel.rois()[0].center_y), (50.0, 60.0))
+
+    def test_load_empty_list_clears_all_rois(self) -> None:
+        self.panel.add_roi(10.0, 10.0)
+        self.panel.load_rois([])
+        self.assertEqual(self.panel.rois(), [])
+
+    def test_loaded_rois_get_real_overlay_items(self) -> None:
+        self.panel.load_rois([AreaRoi(area_roi_id=1, center_x=20.0, center_y=30.0, sample_radius_px=5.0)])
+        self.assertIn(1, self.panel._sample_items)
+        self.assertIn(1, self.panel._reference_items)
+
+    def test_notifies_on_rois_changed_callback(self) -> None:
+        calls = []
+        self.panel.set_on_rois_changed(lambda: calls.append(1))
+        self.panel.load_rois([AreaRoi(area_roi_id=1, center_x=20.0, center_y=30.0, sample_radius_px=5.0)])
+        self.assertGreaterEqual(len(calls), 1)
 
 
 class ImageViewPanelTests(unittest.TestCase):
