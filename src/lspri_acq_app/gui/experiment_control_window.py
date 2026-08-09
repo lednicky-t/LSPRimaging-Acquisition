@@ -64,12 +64,23 @@ and editing controller, comparable to Tier 2's own size):
   export buttons are present with matching icons/tooltips but are NOT wired
   to real file I/O yet (`_on_import_plan_clicked`/`_on_export_plan_clicked`
   just report "not implemented").
-- Still to come, in later sessions: the manual single-step editor row
-  (Duration/CHs/Dir/Tube/Flow/CH1-4/Valve/Color/Comment, including the
-  "CHs" uniform/per-channel toggle and switch-solution combo), the real
+- The manual single-step editor row (Duration/Valve/Color/Switch/Comment
+  plus per-channel Flow/Direction) landed 2026-08-09, matching sLSPR acq's
+  own `_current_editor_step` field mapping exactly - `add_step_button` now
+  composes a real `PumpPlanStep` from these widgets (was a bare default
+  step before). Simplified relative to sLSPR acq: no time-unit toggle
+  (duration is always seconds), no "CHs" uniform/per-channel toggle for
+  direction (always per-channel, same simplification already made for tube
+  diameter), no switch-solution combo (just the raw 1-12 spin), and the
+  settings-gear buttons next to Valve/Color/Switch/Comment are present with
+  matching icons but inert (they need the not-yet-built dialog layer).
+  Tube diameter is deliberately NOT part of this row (see
+  `self.tube_diameter_spins` above) - it isn't step data at all.
+- Still to come, in later sessions: the real
   `flow_plan_model.ExperimentPlanTableModel` + its 8 delegates (replacing
   the lean `PlanTableModel` above), and the Tier-3 dialog layer (color
-  palette, valve labels, pump display settings, pause-state dialog).
+  palette, valve labels, pump display settings, pause-state dialog) that
+  the settings-gear buttons above will eventually open.
 """
 
 from __future__ import annotations
@@ -78,13 +89,18 @@ import logging
 from copy import deepcopy
 from typing import Callable
 
-from PyQt6.QtCore import QSize, QTimer
+from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
+    QDoubleSpinBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -97,13 +113,18 @@ from lspr_acq_shell.device_io_pool import device_io_pool
 from lspr_acq_shell.device_lifecycle import device_label_for
 from lspr_acq_shell.device_manager import DeviceCommunicationService
 from lspr_acq_shell.device_types import PUMP, SELECTOR, SWITCH
-from lspr_acq_shell.experiment_control_builders import create_flow_step_action_button
+from lspr_acq_shell.experiment_control_builders import (
+    create_direction_button,
+    create_flow_step_action_button,
+    set_direction_button,
+    set_step_valve_button_state_for_button,
+)
 from lspr_acq_shell.experiment_control_run_loop import PlanRunLoopMixin
 from lspr_acq_shell.experiment_control_step_decision import StepCommandContext, plan_step_commands
 from lspr_acq_shell.experiment_control_step_runner import _StepApplyResult, _StepApplyRunnable
 from lspr_acq_shell.experiment_control_timeline import PumpPlanTimelineWidget
 from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, PlanColorDelegate, TubeDiameterComboBox
-from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PumpChannelStep, PumpPlanStep, recompute_plan_timing
+from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PLAN_COLOR_OPTIONS, PumpChannelStep, PumpPlanStep, recompute_plan_timing
 
 from lspri_acq_app.gui.plan_table_model import PlanTableModel
 
@@ -161,6 +182,113 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self.record_with_flow_button.setChecked(False)
         self.record_with_flow_button.hide()
         self.recording_controller = None
+
+        # Manual single-step editor row - Duration/Valve/Color/Switch/Comment
+        # plus per-channel Flow/Direction, matching sLSPR acq's editor fields
+        # exactly (same PumpPlanStep mapping as its _current_editor_step) -
+        # added 2026-08-09 as part of the staged visual-parity effort. Tube
+        # diameter is deliberately NOT here (see self.tube_diameter_spins
+        # below) - it isn't step data at all (PumpPlanStep has no tube_mm
+        # field), so sLSPR acq's own _current_editor_step never reads it
+        # either; it only looks like part of the same row there for layout
+        # compactness.
+        self.step_duration_spin = QDoubleSpinBox(self)
+        self.step_duration_spin.setRange(0.0, 86400.0)
+        self.step_duration_spin.setDecimals(1)
+        self.step_duration_spin.setSingleStep(5.0)
+        self.step_duration_spin.setValue(60.0)
+        self.step_duration_spin.setSuffix(" s")
+        self.step_duration_spin.setToolTip("Step duration in seconds.")
+
+        self.manual_flow_spins: list[QDoubleSpinBox] = []
+        self.manual_direction_buttons: list[QToolButton] = []
+        channel_columns = QHBoxLayout()
+        channel_columns.setSpacing(4)
+        for channel in range(1, ACTIVE_PUMP_CHANNELS + 1):
+            channel_column = QVBoxLayout()
+            channel_column.setSpacing(2)
+            channel_column.addWidget(_centered_label(f"CH{channel}"))
+            flow_spin = QDoubleSpinBox(self)
+            flow_spin.setRange(0.0, 10000.0)
+            flow_spin.setDecimals(0)
+            flow_spin.setSingleStep(1.0)
+            flow_spin.setMaximumWidth(82)
+            flow_spin.setToolTip(f"Flow rate for CH{channel} in uL/min.")
+            direction_button = create_direction_button(self, "CW")
+            direction_button.setMaximumWidth(40)
+            direction_button.clicked.connect(
+                lambda _checked=False, b=direction_button: self._toggle_direction_button(b)
+            )
+            self.manual_flow_spins.append(flow_spin)
+            self.manual_direction_buttons.append(direction_button)
+            channel_column.addWidget(flow_spin)
+            channel_column.addWidget(direction_button)
+            channel_columns.addLayout(channel_column)
+
+        self.step_valve_button = QToolButton(self)
+        self.step_valve_button.setCheckable(True)
+        self.step_valve_button.setAutoRaise(True)
+        set_step_valve_button_state_for_button(self, self.step_valve_button, "Open")
+        self.step_valve_button.clicked.connect(self._on_toggle_step_valve_button)
+        self.step_valve_settings_button = create_flow_step_action_button(
+            tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
+            "Edit the text labels used for valve states. (Not yet wired in this app.)",
+        )
+
+        self.step_color_combo = QComboBox(self)
+        self.step_color_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._populate_color_combo(self.step_color_combo)
+        self.step_color_combo.setToolTip("Step color used in the plan timeline for quick visual identification.")
+        self.color_palette_button = create_flow_step_action_button(
+            tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
+            "Edit and overwrite the color palette used by the dropdown. (Not yet wired in this app.)",
+        )
+
+        self.step_switch_spin = QSpinBox(self)
+        self.step_switch_spin.setRange(1, 12)
+        self.step_switch_spin.setValue(1)
+        self.step_switch_spin.setFixedWidth(72)
+        self.step_switch_spin.setToolTip("AMF switch position for this step. Select a port from 1 to 12.")
+        self.step_switch_settings_button = create_flow_step_action_button(
+            tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
+            "Edit the switch solution labels. (Not yet wired in this app.)",
+        )
+
+        self.step_comment_edit = QLineEdit(self)
+        self.step_comment_edit.setPlaceholderText("Comment")
+        self.step_comment_edit.setToolTip("Free-text note for the step. It is shown in the timeline when there is enough space.")
+        self.step_comment_display_button = create_flow_step_action_button(
+            tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
+            "Show all step comments on the pump display. (Not yet wired in this app.)",
+        )
+
+        editor_row = QGridLayout()
+        editor_row.setHorizontalSpacing(6)
+        editor_row.setVerticalSpacing(2)
+        editor_row.addWidget(_centered_label("Duration"), 0, 0)
+        editor_row.addWidget(self.step_duration_spin, 1, 0)
+        editor_row.addWidget(_centered_label("Valve"), 0, 1)
+        valve_cell = QHBoxLayout()
+        valve_cell.addWidget(self.step_valve_button)
+        valve_cell.addWidget(self.step_valve_settings_button)
+        editor_row.addLayout(valve_cell, 1, 1)
+        editor_row.addWidget(_centered_label("Color"), 0, 2)
+        color_cell = QHBoxLayout()
+        color_cell.addWidget(self.step_color_combo)
+        color_cell.addWidget(self.color_palette_button)
+        editor_row.addLayout(color_cell, 1, 2)
+        editor_row.addWidget(_centered_label("Switch"), 0, 3)
+        switch_cell = QHBoxLayout()
+        switch_cell.addWidget(self.step_switch_spin)
+        switch_cell.addWidget(self.step_switch_settings_button)
+        editor_row.addLayout(switch_cell, 1, 3)
+        editor_row.addWidget(_centered_label("Comment"), 0, 4)
+        comment_cell = QHBoxLayout()
+        comment_cell.addWidget(self.step_comment_edit, 1)
+        comment_cell.addWidget(self.step_comment_display_button)
+        editor_row.addLayout(comment_cell, 1, 4)
+        editor_row.setColumnStretch(4, 1)
+        editor_row.addLayout(channel_columns, 0, 5, 2, 1)
 
         self._table_model = PlanTableModel(recompute_plan_timing(_default_plan_steps()))
         self.plan_table = ExperimentControlTableView(self)
@@ -235,7 +363,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             tint_tabler_icon(flow_tabler_icon("file_export"), QColor("#8fbaff")),
             "Export the current experiment plan to CSV or TXT. (Not yet wired in this app.)",
         )
-        self.add_step_button.clicked.connect(self._on_add_step_clicked)
+        self.add_step_button.clicked.connect(self._add_experiment_control_step_from_editor)
         self.duplicate_step_button.clicked.connect(self._on_duplicate_step_clicked)
         self.remove_step_button.clicked.connect(self._on_delete_step_clicked)
         self.import_plan_button.clicked.connect(self._on_import_plan_clicked)
@@ -285,6 +413,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(editor_row)
         layout.addLayout(toolbar)
         layout.addLayout(tube_row)
         layout.addWidget(self.plan_table, 1)
@@ -642,9 +771,56 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
     # Toolbar actions
     # ═══════════════════════════════════════════════════════════════════
 
-    def _on_add_step_clicked(self) -> None:
+    def _populate_color_combo(self, combo: QComboBox) -> None:
+        combo.clear()
+        for label, color in PLAN_COLOR_OPTIONS:
+            combo.addItem(label, color)
+
+    def _default_experiment_control_color(self, step_index: int) -> str:
+        return PLAN_COLOR_OPTIONS[step_index % len(PLAN_COLOR_OPTIONS)][1]
+
+    def _valve_state_label(self, valve: str) -> str:
+        # No custom valve-label editing yet (that needs the not-yet-wired
+        # settings dialog - see step_valve_settings_button) - always the raw
+        # Open/Close state.
+        return "Close" if str(valve or "").strip().lower() == "close" else "Open"
+
+    def _on_toggle_step_valve_button(self) -> None:
+        current = str(self.step_valve_button.property("valve") or "Open")
+        next_state = "Close" if current != "Close" else "Open"
+        set_step_valve_button_state_for_button(self, self.step_valve_button, next_state)
+
+    def _current_editor_step(self, step_number: int) -> PumpPlanStep:
+        color = self.step_color_combo.currentData()
+        return PumpPlanStep(
+            step=step_number,
+            duration_s=max(self.step_duration_spin.value(), 0.0),
+            color=str(color or self._default_experiment_control_color(step_number - 1)),
+            valve=str(self.step_valve_button.property("valve") or "Open"),
+            switch_position=max(min(self.step_switch_spin.value(), 12), 1),
+            description=self.step_comment_edit.text().strip(),
+            channels=[
+                PumpChannelStep(
+                    flow_ul_min=max(round(self.manual_flow_spins[index].value()), 0),
+                    direction=self._direction_button_value(self.manual_direction_buttons[index]),
+                )
+                for index in range(ACTIVE_PUMP_CHANNELS)
+            ],
+        )
+
+    def _direction_button_value(self, button: QToolButton) -> str:
+        value = button.property("direction")
+        return str(value) if value in {"CW", "CCW"} else "CW"
+
+    def _toggle_direction_button(self, button: QToolButton) -> None:
+        next_direction = "CCW" if self._direction_button_value(button) == "CW" else "CW"
+        set_direction_button(self, button, next_direction)
+
+    def _add_experiment_control_step_from_editor(self) -> None:
         row = self._selected_experiment_control_row()
-        new_row = self._table_model.insert_step_after(row if row is not None else len(self._table_model.steps()) - 1)
+        insert_at = len(self._table_model.steps()) if row is None else row + 1
+        step = self._current_editor_step(insert_at + 1)
+        new_row = self._table_model.insert_step(row if row is not None else -1, step)
         self.plan_table.selectRow(new_row)
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
 
@@ -672,6 +848,12 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         if new_row is not None:
             self.plan_table.selectRow(new_row)
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
+
+
+def _centered_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return label
 
 
 def _default_plan_steps() -> list[PumpPlanStep]:

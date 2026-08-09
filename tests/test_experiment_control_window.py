@@ -24,6 +24,7 @@ from unittest.mock import patch
 from PyQt6.QtWidgets import QApplication
 
 from lspr_acq_shell.device_io_pool import device_io_pool
+from lspr_acq_shell.experiment_control_builders import set_step_valve_button_state_for_button
 from lspr_acq_shell.experiment_control_step_decision import plan_step_commands
 from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, DEFAULT_TUBE_MM, TUBE_DIAMETER_OPTIONS
 from lspri_acq_app.gui.experiment_control_window import ExperimentControlWindow
@@ -170,8 +171,78 @@ class StepEditingTests(unittest.TestCase):
 
     def test_add_step_appends_a_new_row(self) -> None:
         self.window.plan_table.selectRow(0)
-        self.window._on_add_step_clicked()
+        self.window._add_experiment_control_step_from_editor()
         self.assertEqual(len(self.window._read_experiment_control_steps()), 2)
+
+    def test_add_step_inserts_after_the_selected_row_not_always_at_the_end(self) -> None:
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()  # -> row 1
+        self.window.plan_table.selectRow(0)
+        self.window.step_comment_edit.setText("inserted-second")
+        self.window._add_experiment_control_step_from_editor()
+        steps = self.window._read_experiment_control_steps()
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(steps[1].description, "inserted-second")
+
+
+class ManualEditorRowTests(unittest.TestCase):
+    """The manual single-step editor row (Duration/Valve/Color/Switch/Comment
+    plus per-channel Flow/Direction) - added 2026-08-09, matching sLSPR
+    acq's own _current_editor_step field mapping exactly."""
+
+    def setUp(self) -> None:
+        self.window = ExperimentControlWindow()
+        self.addCleanup(_close_and_flush, self.window)
+
+    def test_add_step_uses_the_editors_current_values(self) -> None:
+        self.window.step_duration_spin.setValue(42.0)
+        self.window.step_comment_edit.setText("editor comment")
+        self.window.step_switch_spin.setValue(7)
+        self.window.manual_flow_spins[1].setValue(123.0)
+        set_step_valve_button_state_for_button(self.window, self.window.step_valve_button, "Close")
+
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()
+        new_step = self.window._read_experiment_control_steps()[1]
+
+        self.assertEqual(new_step.duration_s, 42.0)
+        self.assertEqual(new_step.description, "editor comment")
+        self.assertEqual(new_step.switch_position, 7)
+        self.assertEqual(new_step.channels[1].flow_ul_min, 123.0)
+        self.assertEqual(new_step.valve, "Close")
+
+    def test_add_step_uses_the_selected_colors_hex_value(self) -> None:
+        self.window.step_color_combo.setCurrentIndex(2)  # "Red", per PLAN_COLOR_OPTIONS
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()
+        new_step = self.window._read_experiment_control_steps()[1]
+        self.assertEqual(new_step.color, self.window.step_color_combo.currentData())
+
+    def test_direction_button_toggles_between_cw_and_ccw(self) -> None:
+        button = self.window.manual_direction_buttons[0]
+        self.assertEqual(self.window._direction_button_value(button), "CW")
+        button.click()
+        self.assertEqual(self.window._direction_button_value(button), "CCW")
+
+    def test_add_step_captures_the_toggled_direction(self) -> None:
+        self.window.manual_direction_buttons[0].click()  # -> CCW
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()
+        new_step = self.window._read_experiment_control_steps()[1]
+        self.assertEqual(new_step.channels[0].direction, "CCW")
+
+    def test_toggle_step_valve_button_flips_open_and_close(self) -> None:
+        self.assertEqual(self.window.step_valve_button.property("valve"), "Open")
+        self.window._on_toggle_step_valve_button()
+        self.assertEqual(self.window.step_valve_button.property("valve"), "Close")
+        self.window._on_toggle_step_valve_button()
+        self.assertEqual(self.window.step_valve_button.property("valve"), "Open")
+
+    def test_color_combo_is_populated_from_the_shared_default_palette(self) -> None:
+        from lspr_acq_shell.pump_plan import PLAN_COLOR_OPTIONS
+
+        self.assertEqual(self.window.step_color_combo.count(), len(PLAN_COLOR_OPTIONS))
+        self.assertEqual(self.window.step_color_combo.itemText(0), PLAN_COLOR_OPTIONS[0][0])
 
     def test_duplicate_step_clones_the_selected_row(self) -> None:
         self.window.plan_table.selectRow(0)
@@ -182,14 +253,14 @@ class StepEditingTests(unittest.TestCase):
 
     def test_delete_step_removes_the_selected_row(self) -> None:
         self.window.plan_table.selectRow(0)
-        self.window._on_add_step_clicked()
+        self.window._add_experiment_control_step_from_editor()
         self.window.plan_table.selectRow(0)
         self.window._on_delete_step_clicked()
         self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
 
     def test_delete_step_is_ignored_while_plan_is_running(self) -> None:
         self.window.plan_table.selectRow(0)
-        self.window._on_add_step_clicked()
+        self.window._add_experiment_control_step_from_editor()
         self.window._run_experiment_control()
         try:
             self.window.plan_table.selectRow(0)

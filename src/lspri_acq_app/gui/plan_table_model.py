@@ -144,14 +144,18 @@ class PlanTableModel(QAbstractTableModel):
 
     def insert_step_after(self, row: int) -> int:
         """Insert a default step after *row* (or at the end if `row < 0`); returns the new row index."""
-        insert_at = row + 1 if 0 <= row < len(self._steps) else len(self._steps)
         new_step = PumpPlanStep(
-            step=insert_at + 1,
+            step=1,
             duration_s=60.0,
             channels=[PumpChannelStep() for _ in range(ACTIVE_PUMP_CHANNELS)],
         )
+        return self.insert_step(row, new_step)
+
+    def insert_step(self, row: int, step: PumpPlanStep) -> int:
+        """Insert *step* after *row* (or at the end if `row < 0`); returns the new row index."""
+        insert_at = row + 1 if 0 <= row < len(self._steps) else len(self._steps)
         self.beginInsertRows(QModelIndex(), insert_at, insert_at)
-        self._steps.insert(insert_at, new_step)
+        self._steps.insert(insert_at, step)
         self.endInsertRows()
         return insert_at
 
