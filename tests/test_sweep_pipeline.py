@@ -9,9 +9,14 @@ from lspri_acq_app.acquisition.sweep_pipeline import (
     SweepError,
     _queue_put_latest,
 )
+from lspri_acq_app.device.camera_base import CameraSettings
 from lspri_acq_app.device.simulated_camera import SimulatedCamera
 from lspri_acq_app.device.simulated_illumination import SimulatedIllumination
-from lspri_acq_app.domain.models import ImagingAcquisitionSettings
+from lspri_acq_app.domain.models import (
+    ImagingAcquisitionSettings,
+    WavelengthCameraSettings,
+    WavelengthIlluminationSettings,
+)
 
 
 def _wait_until(predicate, timeout_s: float = 5.0, interval_s: float = 0.02) -> bool:
@@ -129,6 +134,7 @@ class SweepControllerLossToProcessingQueueTests(unittest.TestCase):
             settings=settings,
             save_queue=save_queue,
             processing_queue=processing_queue,
+            recording_active=True,  # this test uses save_queue depth as its "N sweeps completed" proxy
         )
 
         controller.start()
@@ -142,6 +148,148 @@ class SweepControllerLossToProcessingQueueTests(unittest.TestCase):
 
         self.assertTrue(completed, f"save_queue only reached {save_queue.qsize()}")
         self.assertLessEqual(processing_queue.qsize(), 1)
+
+
+class PerWavelengthOverrideTests(unittest.TestCase):
+    """2026-08-09: exposure/gain/binning and settle time can now vary per
+    wavelength (ImagingAcquisitionSettings.camera_settings_by_wavelength/
+    illumination_settings_by_wavelength) - these confirm the override
+    actually reaches Camera.configure() and the settle wait, not just that
+    the dataclass fields exist (covered in test_domain_models.py)."""
+
+    def test_camera_is_reconfigured_per_wavelength_with_the_override(self) -> None:
+        configure_calls: list[CameraSettings] = []
+
+        class _RecordingCamera(SimulatedCamera):
+            def configure(self, settings: CameraSettings) -> None:
+                configure_calls.append(settings)
+                super().configure(settings)
+
+        camera = _RecordingCamera()
+        camera.open()
+        illumination = SimulatedIllumination()
+        illumination.open()
+        settings = ImagingAcquisitionSettings(
+            wavelengths_nm=[450.0, 500.0],
+            exposure_us=1000.0,
+            gain=1.0,
+            settle_time_override_ms=0.0,
+            camera_settings_by_wavelength={500.0: WavelengthCameraSettings(exposure_us=9000.0, gain=3.0, binning=2)},
+        )
+        save_queue: "queue.Queue" = queue.Queue()
+        processing_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        controller = SweepController(
+            camera=camera,
+            illumination=illumination,
+            settings=settings,
+            save_queue=save_queue,
+            processing_queue=processing_queue,
+        )
+
+        controller.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(configure_calls) >= 2, timeout_s=5.0))
+        finally:
+            controller.stop(join_timeout_s=2.0)
+
+        self.assertEqual(configure_calls[0].exposure_us, 1000.0)
+        self.assertEqual(configure_calls[0].gain, 1.0)
+        self.assertEqual(configure_calls[1].exposure_us, 9000.0)
+        self.assertEqual(configure_calls[1].gain, 3.0)
+        self.assertEqual(configure_calls[1].binning, 2)
+
+    def test_settle_time_override_is_used_for_its_specific_wavelength_only(self) -> None:
+        waits: list[float] = []
+        camera = SimulatedCamera()
+        camera.open()
+
+        class _RecordingIllumination(SimulatedIllumination):
+            def settle_time_ms(self) -> float:
+                return 0.0
+
+        illumination = _RecordingIllumination()
+        illumination.open()
+        settings = ImagingAcquisitionSettings(
+            wavelengths_nm=[450.0, 500.0],
+            exposure_us=1000.0,
+            settle_time_override_ms=0.0,
+            illumination_settings_by_wavelength={500.0: WavelengthIlluminationSettings(settle_time_ms=25.0)},
+        )
+        save_queue: "queue.Queue" = queue.Queue()
+        processing_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        controller = SweepController(
+            camera=camera,
+            illumination=illumination,
+            settings=settings,
+            save_queue=save_queue,
+            processing_queue=processing_queue,
+        )
+
+        self.assertEqual(controller._settle_time_ms_for(450.0), 0.0)
+        self.assertEqual(controller._settle_time_ms_for(500.0), 25.0)
+
+
+class RecordingActiveGateTests(unittest.TestCase):
+    """2026-08-09: images must not be recorded until a measurement is
+    actually started - SweepController.recording_active gates the save_queue
+    side only; the processing (live preview) queue keeps receiving cubes
+    regardless, so ROI/live-view still works during setup."""
+
+    def _controller(self, **kwargs) -> tuple[SweepController, "queue.Queue", "queue.Queue"]:
+        camera = SimulatedCamera(width_px=16, height_px=16, noise_std=0.0)
+        camera.open()
+        illumination = SimulatedIllumination()
+        illumination.open()
+        settings = ImagingAcquisitionSettings(
+            wavelengths_nm=[450.0], exposure_us=1000.0, settle_time_override_ms=0.0
+        )
+        save_queue: "queue.Queue" = queue.Queue()
+        processing_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        controller = SweepController(
+            camera=camera,
+            illumination=illumination,
+            settings=settings,
+            save_queue=save_queue,
+            processing_queue=processing_queue,
+            **kwargs,
+        )
+        return controller, save_queue, processing_queue
+
+    def test_defaults_to_not_recording(self) -> None:
+        controller, _, _ = self._controller()
+        self.assertFalse(controller.is_recording_active())
+
+    def test_cubes_are_not_saved_while_not_recording_but_still_reach_the_processing_queue(self) -> None:
+        controller, save_queue, processing_queue = self._controller()
+
+        controller.start()
+        try:
+            self.assertTrue(_wait_until(lambda: processing_queue.qsize() >= 1, timeout_s=5.0))
+            time.sleep(0.2)  # give a few more sweeps a chance to run
+        finally:
+            controller.stop(join_timeout_s=2.0)
+
+        self.assertEqual(save_queue.qsize(), 0)
+
+    def test_set_recording_active_arms_saving_from_the_next_cube(self) -> None:
+        controller, save_queue, _ = self._controller()
+
+        controller.start()
+        try:
+            controller.set_recording_active(True)
+            self.assertTrue(controller.is_recording_active())
+            self.assertTrue(_wait_until(lambda: save_queue.qsize() >= 1, timeout_s=5.0))
+        finally:
+            controller.stop(join_timeout_s=2.0)
+
+    def test_recording_active_true_at_construction_saves_immediately(self) -> None:
+        controller, save_queue, _ = self._controller(recording_active=True)
+
+        controller.start()
+        try:
+            self.assertTrue(_wait_until(lambda: save_queue.qsize() >= 1, timeout_s=5.0))
+        finally:
+            controller.stop(join_timeout_s=2.0)
 
 
 if __name__ == "__main__":

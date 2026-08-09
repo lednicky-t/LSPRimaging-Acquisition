@@ -101,6 +101,10 @@ class SweepPipelineSmokeTest(unittest.TestCase):
         )
 
         pipeline.start()
+        # Sweeps start in preview-only mode (2026-08-09: images aren't saved
+        # until a measurement is actually started) - this smoke test is the
+        # golden "recording is on" path, so arm it explicitly.
+        pipeline.set_recording_active(True)
         try:
             completed = _wait_until(lambda: len(saved_cubes) >= 2 and len(sensorgram_points) >= 2, timeout_s=5.0)
         finally:

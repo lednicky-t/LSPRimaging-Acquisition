@@ -100,6 +100,15 @@ class SweepController:
     Assumes camera/illumination are already open (device connection
     lifecycle is the device registry's job, not this class's) - only calls
     Camera.configure(), never Camera.open()/IlluminationSource.open().
+
+    recording_active (2026-08-09) gates the save_queue side only: live
+    preview (the processing queue, ROI extraction, the image view) keeps
+    running whenever the sweep itself is running, but no cube reaches disk
+    until recording is armed - the maintainer's explicit requirement that
+    camera images aren't recorded before a measurement is actually started,
+    mirroring sLSPR acq's own live-view-vs-recording split. Starts False:
+    running a sweep (e.g. to preview focus/exposure while setting up) must
+    never silently start writing image files.
     """
 
     def __init__(
@@ -112,6 +121,7 @@ class SweepController:
         processing_queue: "queue.Queue[SpectralCube]",
         on_error: Callable[[SweepError], None] | None = None,
         acquire_timeout_ms: int = 5000,
+        recording_active: bool = False,
     ) -> None:
         self._camera = camera
         self._illumination = illumination
@@ -123,6 +133,9 @@ class SweepController:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._next_cube_index = 0
+        self._recording_active_event = threading.Event()
+        if recording_active:
+            self._recording_active_event.set()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -136,18 +149,22 @@ class SweepController:
         if self._thread is not None:
             self._thread.join(timeout=join_timeout_s)
 
+    def set_recording_active(self, active: bool) -> None:
+        """Arm/disarm saving cubes to disk. Safe to call while the sweep is
+        running (e.g. the user clicks "Start" partway through a live
+        preview) - takes effect from the next completed cube."""
+        if active:
+            self._recording_active_event.set()
+        else:
+            self._recording_active_event.clear()
+
+    def is_recording_active(self) -> bool:
+        return self._recording_active_event.is_set()
+
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self) -> None:
-        try:
-            self._camera.configure(
-                CameraSettings(exposure_us=self._settings.exposure_us, gain=self._settings.gain)
-            )
-        except Exception as exc:
-            self._report_error(SweepError(self._next_cube_index, f"Camera configure failed: {exc}"))
-            return
-
         while not self._stop_event.is_set():
             cube = self._run_one_sweep()
             if cube is None:
@@ -159,8 +176,9 @@ class SweepController:
                 # immediately instead of waiting out the backoff.
                 self._stop_event.wait(_SWEEP_ERROR_BACKOFF_S)
                 continue
-            self._save_queue.put(cube)  # lossless: unbounded, never drops a cube
-            _queue_put_latest(self._processing_queue, cube)  # latest-only
+            if self._recording_active_event.is_set():
+                self._save_queue.put(cube)  # lossless: unbounded, never drops a cube
+            _queue_put_latest(self._processing_queue, cube)  # latest-only, always (live preview)
 
     def _run_one_sweep(self) -> SpectralCube | None:
         cube_index = self._next_cube_index
@@ -169,12 +187,9 @@ class SweepController:
             if self._stop_event.is_set():
                 return None
             try:
+                self._camera.configure(self._camera_settings_for(wavelength_nm))
                 self._illumination.set_wavelength(wavelength_nm)
-                settle_ms = (
-                    self._settings.settle_time_override_ms
-                    if self._settings.settle_time_override_ms is not None
-                    else self._illumination.settle_time_ms()
-                )
+                settle_ms = self._settle_time_ms_for(wavelength_nm)
                 if settle_ms > 0:
                     self._stop_event.wait(settle_ms / 1000.0)
                 frame = self._camera.acquire_frame(timeout_ms=self._acquire_timeout_ms)
@@ -185,6 +200,20 @@ class SweepController:
                 return None
         self._next_cube_index += 1
         return builder.finalize()
+
+    def _camera_settings_for(self, wavelength_nm: float) -> CameraSettings:
+        override = self._settings.camera_settings_by_wavelength.get(wavelength_nm)
+        if override is None:
+            return CameraSettings(exposure_us=self._settings.exposure_us, gain=self._settings.gain)
+        return CameraSettings(exposure_us=override.exposure_us, gain=override.gain, binning=override.binning)
+
+    def _settle_time_ms_for(self, wavelength_nm: float) -> float:
+        override = self._settings.illumination_settings_by_wavelength.get(wavelength_nm)
+        if override is not None and override.settle_time_ms is not None:
+            return override.settle_time_ms
+        if self._settings.settle_time_override_ms is not None:
+            return self._settings.settle_time_override_ms
+        return self._illumination.settle_time_ms()
 
     def _report_error(self, error: SweepError) -> None:
         _LOGGER.error("Sweep error (cube %d): %s", error.cube_index, error.message)
@@ -375,6 +404,15 @@ class SweepPipeline:
         self.sweep.stop(join_timeout_s=join_timeout_s)
         self.save_writer.stop(join_timeout_s=join_timeout_s)
         self.processing.stop(join_timeout_s=join_timeout_s)
+
+    def set_recording_active(self, active: bool) -> None:
+        """Arm/disarm saving - passthrough to the sweep controller, the
+        single point that decides whether a completed cube reaches the save
+        queue (see SweepController's own docstring)."""
+        self.sweep.set_recording_active(active)
+
+    def is_recording_active(self) -> bool:
+        return self.sweep.is_recording_active()
 
 
 def build_sweep_pipeline(

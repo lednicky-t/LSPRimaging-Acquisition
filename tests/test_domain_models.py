@@ -10,6 +10,8 @@ from lspri_acq_app.domain.models import (
     Frame,
     ImagingAcquisitionSettings,
     SpectralCube,
+    WavelengthCameraSettings,
+    WavelengthIlluminationSettings,
 )
 from lspri_acq_app.domain.roi import AreaRoi, AreaRoiGroup
 
@@ -39,6 +41,25 @@ class ImagingAcquisitionSettingsTests(unittest.TestCase):
         settings = ImagingAcquisitionSettings(wavelengths_nm=[450.0, 500.0], exposure_us=1000.0)
         self.assertIsNone(settings.settle_time_override_ms)
         self.assertIsNone(settings.gain)
+
+    def test_per_wavelength_override_dicts_default_to_empty_and_are_independent_per_instance(self) -> None:
+        first = ImagingAcquisitionSettings(wavelengths_nm=[450.0], exposure_us=1000.0)
+        second = ImagingAcquisitionSettings(wavelengths_nm=[450.0], exposure_us=1000.0)
+        first.camera_settings_by_wavelength[450.0] = WavelengthCameraSettings(exposure_us=2000.0)
+        self.assertEqual(second.camera_settings_by_wavelength, {})
+        self.assertEqual(second.illumination_settings_by_wavelength, {})
+
+    def test_wavelength_camera_settings_keeps_binning_and_saving_mode_defaults(self) -> None:
+        settings = WavelengthCameraSettings(exposure_us=1500.0)
+        self.assertEqual(settings.binning, 1)
+        self.assertEqual(settings.saving_mode, "all_frames")
+        self.assertIsNone(settings.crop_x_px)
+
+    def test_wavelength_illumination_settings_defaults(self) -> None:
+        settings = WavelengthIlluminationSettings()
+        self.assertIsNone(settings.settle_time_ms)
+        self.assertIsNone(settings.current)
+        self.assertEqual(settings.spectrum_source, "default_file")
 
 
 class AbsorbanceSpectrumResultTests(unittest.TestCase):

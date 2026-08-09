@@ -42,12 +42,52 @@ class SpectralCube:
 
 
 @dataclass(slots=True)
+class WavelengthCameraSettings:
+    """Per-wavelength camera config, overriding ImagingAcquisitionSettings'
+    global exposure_us/gain for one wavelength - added 2026-08-09 so exposure
+    (and, later, binning/crop) can vary per wavelength for good contrast at
+    each color, per the maintainer's session-recording workflow description.
+    Fields left None/default fall back to the sensor's current setting
+    (resolution/crop) or aren't overridden (binning)."""
+
+    exposure_us: float
+    gain: float | None = None
+    binning: int = 1
+    resolution_width_px: int | None = None
+    resolution_height_px: int | None = None
+    crop_x_px: int | None = None
+    crop_y_px: int | None = None
+    crop_width_px: int | None = None
+    crop_height_px: int | None = None
+    saving_mode: str = "all_frames"
+
+
+@dataclass(slots=True)
+class WavelengthIlluminationSettings:
+    """Per-wavelength illumination config - settle time, LED current, and
+    which spectrum (measured vs. a default pre-measured file) this
+    wavelength's entry uses. Added alongside WavelengthCameraSettings, same
+    2026-08-09 design discussion."""
+
+    settle_time_ms: float | None = None
+    current: float | None = None
+    spectrum_source: str = "default_file"
+
+
+@dataclass(slots=True)
 class ImagingAcquisitionSettings:
     wavelengths_nm: list[float]
     exposure_us: float
     gain: float | None = None
     # None means: use illumination.settle_time_ms() for every step.
     settle_time_override_ms: float | None = None
+    # Per-wavelength overrides, keyed by the exact value in wavelengths_nm.
+    # A wavelength absent from these dicts falls back to exposure_us/gain and
+    # settle_time_override_ms/illumination.settle_time_ms() above - existing
+    # callers that never set these two dicts keep today's global-only
+    # behavior unchanged.
+    camera_settings_by_wavelength: dict[float, WavelengthCameraSettings] = field(default_factory=dict)
+    illumination_settings_by_wavelength: dict[float, WavelengthIlluminationSettings] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
