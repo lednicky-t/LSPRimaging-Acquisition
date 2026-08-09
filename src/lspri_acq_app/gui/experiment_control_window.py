@@ -83,12 +83,34 @@ and editing controller, comparable to Tier 2's own size):
   bordered, gradient-outlined ones (`ExperimentControlDialogs.edit_valve_labels`/
   `edit_color_palette_entries`, ~185/~300 lines each) - same editable data
   (label+color per valve state; name+color pairs for the palette), simpler
-  chrome. Neither persists across restarts yet (sLSPR acq saves both to its
-  UI-state file; this app has no settings-persistence story yet at all).
+  chrome.
+- Switch-solution and pump-display dialogs (`step_switch_settings_button`/
+  `step_comment_display_button`) landed 2026-08-09, same lean-dialog
+  pattern. The switch editor traced sLSPR acq's *actual current* behavior
+  rather than its field names: `step_switch_spin` (a raw 1-12 spinbox) was
+  removed entirely in favor of `step_switch_combo` ("N: solution name")
+  since sLSPR acq's own `_set_switch_solution_mode` unconditionally hides
+  the spin and the mode-toggle button regardless of their arguments - that
+  code path is effectively dead there now. sLSPR acq's switch-solution
+  dialog also has per-position Concentration/Unit/Notes fields; only the
+  Solution label is edited here, since nothing in this app reads the
+  others. The pump-display dialog is wired to a setting with a real
+  effect: `StepCommandContext.pump_display_enabled` (was hardcoded `False`
+  before this dialog existed) - checking it means step comments actually
+  get sent to the pump's own 16-character display. Its "highlight the
+  limit in the plan table" checkbox is left out (needs per-cell
+  highlighting the lean `PlanTableModel` doesn't implement).
+- Settings persistence landed 2026-08-09, using the already-shared
+  `lspr_acq_shell.settings_store` engine directly (its own module docstring
+  gives this exact usage pattern for a second app) - valve labels/colors,
+  the color palette, switch-solution labels, the pump-display setting, and
+  tube diameters now survive an app restart, saved to this app's own
+  `lspri_acq_settings.json` (not sLSPR acq's `lspr_settings.json`). The
+  plan itself is deliberately NOT persisted this way - it's project/session
+  state, not a UI setting, same distinction sLSPR acq makes.
 - Still to come, in later sessions: the real
   `flow_plan_model.ExperimentPlanTableModel` + its 8 delegates (replacing
-  the lean `PlanTableModel` above), the switch-solution and pump-display
-  dialogs (their gear buttons are still inert), and settings persistence.
+  the lean `PlanTableModel` above), real import/export file I/O.
 """
 
 from __future__ import annotations
@@ -101,6 +123,7 @@ from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -112,7 +135,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -127,6 +149,7 @@ from lspr_acq_shell.device_io_pool import device_io_pool
 from lspr_acq_shell.device_lifecycle import device_label_for
 from lspr_acq_shell.device_manager import DeviceCommunicationService
 from lspr_acq_shell.device_types import PUMP, SELECTOR, SWITCH
+from lspr_acq_shell.reglo_icc import PUMP_DISPLAY_MAX_LENGTH
 from lspr_acq_shell.experiment_control_builders import (
     create_direction_button,
     create_flow_step_action_button,
@@ -139,10 +162,18 @@ from lspr_acq_shell.experiment_control_step_runner import _StepApplyResult, _Ste
 from lspr_acq_shell.experiment_control_timeline import PumpPlanTimelineWidget
 from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, PlanColorDelegate, TubeDiameterComboBox
 from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PLAN_COLOR_OPTIONS, PumpChannelStep, PumpPlanStep, recompute_plan_timing
+from lspr_acq_shell.settings_store import load_app_setting, save_app_setting
+from lspr_acq_shell.user_profile import current_config_path
 
 from lspri_acq_app.gui.plan_table_model import PlanTableModel
 
 _LOGGER = logging.getLogger("lspri_acq_app.experiment_control")
+
+# Own settings file, not sLSPR acq's "lspr_settings.json" - each app gets
+# its own per-user settings file under the same shared config directory
+# (lspr_acq_shell.user_profile.current_config_path), matching the pattern
+# lspr_acq_shell.settings_store's own module docstring recommends.
+_SETTINGS_FILENAME = "lspri_acq_settings.json"
 
 _COLOR_COLUMN = 4 + 2 * ACTIVE_PUMP_CHANNELS  # matches plan_table_model's layout
 
@@ -164,6 +195,18 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._theme_mode = "dark"
 
         self._device_comm_service = DeviceCommunicationService.shared()
+
+        # Settings persistence - added 2026-08-09, using the already-shared
+        # lspr_acq_shell.settings_store engine directly (its own module
+        # docstring gives this exact usage pattern for a second app). One
+        # blob under a single "experiment_control" app-setting key, loaded
+        # once here and re-read at each state-initialization point below;
+        # saved again after each dialog's Accept and after a tube-diameter
+        # change. Does NOT include the plan itself - that's project/session
+        # state, not a UI setting, same distinction sLSPR acq makes.
+        self._persisted_settings: dict = load_app_setting(
+            "experiment_control", {}, path=self._settings_path()
+        ) or {}
 
         # Runtime state PlanRunLoopMixin owns - initialized here exactly like
         # sLSPR acq's own ExperimentControlWindow.__init__, since the mixin
@@ -242,8 +285,12 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         # Valve state labels/colors - editable via step_valve_settings_button
         # (a lean QDialog, not sLSPR acq's custom frameless-bordered one -
         # see _edit_valve_state_labels's docstring).
-        self._valve_state_labels: dict[str, str] = {"Open": "Open", "Close": "Close"}
-        self._valve_state_colors: dict[str, str] = {"Open": "#4E79A7", "Close": "#B44A4A"}
+        self._valve_state_labels: dict[str, str] = self._persisted_settings.get(
+            "valve_state_labels", {"Open": "Open", "Close": "Close"}
+        )
+        self._valve_state_colors: dict[str, str] = self._persisted_settings.get(
+            "valve_state_colors", {"Open": "#4E79A7", "Close": "#B44A4A"}
+        )
 
         self.step_valve_button = QToolButton(self)
         self.step_valve_button.setCheckable(True)
@@ -256,7 +303,12 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         )
         self.step_valve_settings_button.clicked.connect(self._edit_valve_state_labels)
 
-        self._color_palette_entries: list[tuple[str, str]] = list(PLAN_COLOR_OPTIONS)
+        persisted_palette = self._persisted_settings.get("color_palette_entries")
+        self._color_palette_entries: list[tuple[str, str]] = (
+            [(str(name), str(color)) for name, color in persisted_palette]
+            if isinstance(persisted_palette, list) and persisted_palette
+            else list(PLAN_COLOR_OPTIONS)
+        )
 
         self.step_color_combo = QComboBox(self)
         self.step_color_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -268,23 +320,44 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         )
         self.color_palette_button.clicked.connect(self._edit_color_palette_entries)
 
-        self.step_switch_spin = QSpinBox(self)
-        self.step_switch_spin.setRange(1, 12)
-        self.step_switch_spin.setValue(1)
-        self.step_switch_spin.setFixedWidth(72)
-        self.step_switch_spin.setToolTip("AMF switch position for this step. Select a port from 1 to 12.")
+        # Switch position editor: a "N: label" combo, not a raw 1-12 spin -
+        # matching sLSPR acq's *actual current* behavior, not its field
+        # names. Traced rather than assumed: sLSPR acq's own
+        # _set_switch_solution_mode unconditionally forces
+        # step_switch_spin.setVisible(False)/step_switch_combo.setVisible(True)
+        # regardless of its `enabled` argument or the stored
+        # _switch_solution_mode setting - the raw-spin/mode-toggle path is
+        # effectively dead code there now, so it isn't built here either.
+        persisted_switch_labels = self._persisted_settings.get("switch_solution_labels")
+        self._switch_solution_labels: list[str] = (
+            [str(label) for label in persisted_switch_labels[:12]] + [""] * max(0, 12 - len(persisted_switch_labels))
+            if isinstance(persisted_switch_labels, list)
+            else [""] * 12
+        )
+        self.step_switch_combo = QComboBox(self)
+        self.step_switch_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._populate_switch_solution_combo(self.step_switch_combo, 1)
+        self.step_switch_combo.setToolTip("AMF switch position and solution for this step.")
         self.step_switch_settings_button = create_flow_step_action_button(
             tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
-            "Edit the switch solution labels. (Not yet wired in this app.)",
+            "Edit the switch solution labels.",
         )
+        self.step_switch_settings_button.clicked.connect(self._edit_switch_solution_labels)
+
+        # Real, already-consequential setting: feeds StepCommandContext.pump_display_enabled
+        # (was hardcoded False before this dialog existed) - whether a
+        # step's comment actually gets sent to the pump's own 16-character
+        # display when that step is applied to real hardware.
+        self._pump_display_enabled = bool(self._persisted_settings.get("pump_display_enabled", False))
 
         self.step_comment_edit = QLineEdit(self)
         self.step_comment_edit.setPlaceholderText("Comment")
         self.step_comment_edit.setToolTip("Free-text note for the step. It is shown in the timeline when there is enough space.")
         self.step_comment_display_button = create_flow_step_action_button(
             tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
-            "Show all step comments on the pump display. (Not yet wired in this app.)",
+            "Show all step comments on the pump display.",
         )
+        self.step_comment_display_button.clicked.connect(self._edit_pump_display_settings)
 
         editor_row = QGridLayout()
         editor_row.setHorizontalSpacing(6)
@@ -303,7 +376,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         editor_row.addLayout(color_cell, 1, 2)
         editor_row.addWidget(_centered_label("Switch"), 0, 3)
         switch_cell = QHBoxLayout()
-        switch_cell.addWidget(self.step_switch_spin)
+        switch_cell.addWidget(self.step_switch_combo)
         switch_cell.addWidget(self.step_switch_settings_button)
         editor_row.addLayout(switch_cell, 1, 3)
         editor_row.addWidget(_centered_label("Comment"), 0, 4)
@@ -325,6 +398,9 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
 
         self.timeline_widget = PumpPlanTimelineWidget(self)
 
+        persisted_tube_mm = self._persisted_settings.get("tube_mm_by_channel")
+        if not (isinstance(persisted_tube_mm, list) and len(persisted_tube_mm) == ACTIVE_PUMP_CHANNELS):
+            persisted_tube_mm = None
         self.tube_diameter_spins: list[TubeDiameterComboBox] = []
         tube_row = QHBoxLayout()
         tube_row.addWidget(QLabel("Tube diameter (mm):", self))
@@ -332,6 +408,9 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             tube_row.addWidget(QLabel(f"CH{channel}", self))
             spin = TubeDiameterComboBox(self)
             spin.setToolTip(f"Tubing inner diameter for CH{channel} in mm. Only the pump's supported sizes are selectable.")
+            if persisted_tube_mm is not None:
+                spin.setValue(float(persisted_tube_mm[channel - 1]))
+            spin.valueChanged.connect(self._save_experiment_control_settings)
             self.tube_diameter_spins.append(spin)
             tube_row.addWidget(spin)
         tube_row.addStretch(1)
@@ -686,7 +765,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             tube_mm_by_channel=[spin.value() for spin in self.tube_diameter_spins],
             pump_backsteps=0,
             pump_roller_count=8,
-            pump_display_enabled=False,
+            pump_display_enabled=self._pump_display_enabled,
             plan_running=self._plan_running,
             plan_holding=self._plan_holding,
             switch_controller_type=switch_controller_type,
@@ -792,6 +871,27 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         callback()
 
     # ═══════════════════════════════════════════════════════════════════
+    # Settings persistence
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _settings_path(self):
+        return current_config_path(_SETTINGS_FILENAME)
+
+    def _save_experiment_control_settings(self) -> None:
+        save_app_setting(
+            "experiment_control",
+            {
+                "valve_state_labels": self._valve_state_labels,
+                "valve_state_colors": self._valve_state_colors,
+                "color_palette_entries": [list(entry) for entry in self._color_palette_entries],
+                "switch_solution_labels": self._switch_solution_labels,
+                "pump_display_enabled": self._pump_display_enabled,
+                "tube_mm_by_channel": [spin.value() for spin in self.tube_diameter_spins],
+            },
+            path=self._settings_path(),
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
     # Toolbar actions
     # ═══════════════════════════════════════════════════════════════════
 
@@ -803,6 +903,119 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
     def _default_experiment_control_color(self, step_index: int) -> str:
         palette = self._color_palette_entries or list(PLAN_COLOR_OPTIONS)
         return palette[step_index % len(palette)][1]
+
+    def _switch_solution_label(self, position: int) -> str:
+        index = max(min(int(position), 12), 1) - 1
+        if 0 <= index < len(self._switch_solution_labels):
+            label = str(self._switch_solution_labels[index]).strip()
+            if label:
+                return label
+        return "empty"
+
+    def _switch_display_text(self, position: int) -> str:
+        normalized = max(min(int(position), 12), 1)
+        return f"{normalized}: {self._switch_solution_label(normalized)}"
+
+    def _populate_switch_solution_combo(self, combo: QComboBox, selected_position: int | None = None) -> None:
+        current_position = max(min(int(selected_position or 1), 12), 1)
+        combo.blockSignals(True)
+        combo.clear()
+        for position in range(1, 13):
+            combo.addItem(self._switch_display_text(position), position)
+        combo.setCurrentIndex(current_position - 1)
+        combo.blockSignals(False)
+
+    def _current_switch_position_from_editor(self) -> int:
+        data = self.step_switch_combo.currentData()
+        if isinstance(data, (int, float)):
+            return max(min(int(data), 12), 1)
+        return max(min(self.step_switch_combo.currentIndex() + 1, 12), 1)
+
+    def _edit_switch_solution_labels(self) -> None:
+        """Edit the per-position solution name shown in the switch combo.
+
+        A lean standard QDialog (a 12-row QTableWidget, one "Solution"
+        column), not sLSPR acq's custom frameless-bordered one
+        (`ExperimentControlDialogs.edit_switch_solution_labels`) - and
+        deliberately simplified relative to it: sLSPR acq's dialog also has
+        per-position Concentration/Unit/Notes fields; this only edits the
+        label actually used anywhere in this app's own logic
+        (`_switch_solution_labels`) - the other fields aren't read by
+        anything here yet. Part of the staged visual-parity effort's
+        dialog-layer slice.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Switch solutions")
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(12, 2, dialog)
+        table.setHorizontalHeaderLabels(["Position", "Solution"])
+        table.verticalHeader().setVisible(False)
+        for position in range(1, 13):
+            row = position - 1
+            position_item = QTableWidgetItem(str(position))
+            position_item.setFlags(position_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, 0, position_item)
+            table.setItem(row, 1, QTableWidgetItem(self._switch_solution_labels[row]))
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        labels = []
+        for row in range(12):
+            item = table.item(row, 1)
+            labels.append(item.text().strip() if item is not None else "")
+        self._switch_solution_labels = labels
+        current_position = self._current_switch_position_from_editor()
+        self._populate_switch_solution_combo(self.step_switch_combo, current_position)
+        self._save_experiment_control_settings()
+
+    def _edit_pump_display_settings(self) -> None:
+        """Toggle whether a step's comment is sent to the pump's own
+        16-character display when that step is applied to real hardware -
+        a lean `QCheckBox` + live preview dialog, not sLSPR acq's custom
+        frameless-bordered one (`ExperimentControlDialogs.edit_pump_display_settings`).
+        Unlike the other three dialogs in this file, this one is wired to a
+        setting that already has a real effect: `_apply_step_to_pump_async`
+        reads `self._pump_display_enabled` into `StepCommandContext`, which
+        was hardcoded `False` before this dialog existed. The "highlight
+        the limit in the plan table" checkbox sLSPR acq also has is left
+        out - it needs per-cell highlighting the lean `PlanTableModel`
+        doesn't implement.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Pump display")
+        layout = QVBoxLayout(dialog)
+
+        checkbox = QCheckBox("Show step comments on pump display", dialog)
+        checkbox.setChecked(self._pump_display_enabled)
+        layout.addWidget(checkbox)
+
+        preview = QLabel(dialog)
+        preview.setToolTip(f"Preview - the pump display shows at most {PUMP_DISPLAY_MAX_LENGTH} characters.")
+        layout.addWidget(preview)
+
+        def _update_preview() -> None:
+            text = self.step_comment_edit.text().strip()[:PUMP_DISPLAY_MAX_LENGTH]
+            preview.setText(f"Preview: {text!r}" if checkbox.isChecked() else "Preview: (nothing sent)")
+
+        checkbox.toggled.connect(_update_preview)
+        _update_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._pump_display_enabled = checkbox.isChecked()
+        self._save_experiment_control_settings()
 
     def _edit_color_palette_entries(self) -> None:
         """Edit the name/color entries offered in the step-color dropdown.
@@ -880,6 +1093,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         restored_index = self.step_color_combo.findData(current_color)
         if restored_index >= 0:
             self.step_color_combo.setCurrentIndex(restored_index)
+        self._save_experiment_control_settings()
 
     def _valve_state_label(self, valve: str) -> str:
         normalized = "Close" if str(valve or "").strip().lower() == "close" else "Open"
@@ -936,6 +1150,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._valve_state_colors = chosen_colors
         current = str(self.step_valve_button.property("valve") or "Open")
         set_step_valve_button_state_for_button(self, self.step_valve_button, current)
+        self._save_experiment_control_settings()
 
     def _on_toggle_step_valve_button(self) -> None:
         current = str(self.step_valve_button.property("valve") or "Open")
@@ -949,7 +1164,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             duration_s=max(self.step_duration_spin.value(), 0.0),
             color=str(color or self._default_experiment_control_color(step_number - 1)),
             valve=str(self.step_valve_button.property("valve") or "Open"),
-            switch_position=max(min(self.step_switch_spin.value(), 12), 1),
+            switch_position=self._current_switch_position_from_editor(),
             description=self.step_comment_edit.text().strip(),
             channels=[
                 PumpChannelStep(

@@ -18,10 +18,13 @@ actually connected, just report status messages saying so.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem
 
 from lspr_acq_shell.device_io_pool import device_io_pool
 from lspr_acq_shell.experiment_control_builders import set_step_valve_button_state_for_button
@@ -38,6 +41,25 @@ def _close_and_flush(widget) -> None:
     QApplication.processEvents()
 
 
+def _make_window(testcase: unittest.TestCase, *, settings_path: Path | None = None) -> ExperimentControlWindow:
+    """Construct a real ExperimentControlWindow with settings persistence
+    redirected to an isolated temp file, not the real per-user
+    lspri_acq_settings.json - every dialog-accept path in this window calls
+    _save_experiment_control_settings(), so without this every test run
+    would read/write the maintainer's real settings file and pollute later
+    tests in this same file with whatever an earlier test saved."""
+    if settings_path is None:
+        tmp_dir = tempfile.TemporaryDirectory()
+        testcase.addCleanup(tmp_dir.cleanup)
+        settings_path = Path(tmp_dir.name) / "lspri_acq_settings.json"
+    patcher = patch.object(ExperimentControlWindow, "_settings_path", lambda self: settings_path)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    window = ExperimentControlWindow()
+    testcase.addCleanup(_close_and_flush, window)
+    return window
+
+
 def _drain_device_io() -> None:
     """Wait for any in-flight async step-apply dispatch to complete and its
     `done` signal to be delivered, so assertions made right after a state-
@@ -49,8 +71,7 @@ def _drain_device_io() -> None:
 
 class ExperimentControlWindowConstructionTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_starts_with_one_default_step(self) -> None:
         self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
@@ -78,8 +99,7 @@ class ExperimentControlWindowConstructionTests(unittest.TestCase):
 
 class PauseTemplateEditingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_editing_the_pause_template_table_changes_what_pause_row_step_returns(self) -> None:
         model = self.window._pause_template_model
@@ -141,8 +161,7 @@ class TubeDiameterWiringTests(unittest.TestCase):
     StepCommandContext plan_step_commands() is always called with."""
 
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_changed_tube_diameter_flows_into_the_step_command_context(self) -> None:
         distinct_mm = [option.mm for option in TUBE_DIAMETER_OPTIONS if option.mm != DEFAULT_TUBE_MM][0]
@@ -166,8 +185,7 @@ class TubeDiameterWiringTests(unittest.TestCase):
 
 class StepEditingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_add_step_appends_a_new_row(self) -> None:
         self.window.plan_table.selectRow(0)
@@ -191,13 +209,12 @@ class ManualEditorRowTests(unittest.TestCase):
     acq's own _current_editor_step field mapping exactly."""
 
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_add_step_uses_the_editors_current_values(self) -> None:
         self.window.step_duration_spin.setValue(42.0)
         self.window.step_comment_edit.setText("editor comment")
-        self.window.step_switch_spin.setValue(7)
+        self.window.step_switch_combo.setCurrentIndex(6)  # position 7
         self.window.manual_flow_spins[1].setValue(123.0)
         set_step_valve_button_state_for_button(self.window, self.window.step_valve_button, "Close")
 
@@ -276,8 +293,7 @@ class RunHoldPauseStopIntegrationTests(unittest.TestCase):
     (no-hardware) device wiring - not a mock of PlanRunLoopMixin's methods."""
 
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_run_starts_the_plan_and_dispatches_without_crashing(self) -> None:
         self.window._run_experiment_control()
@@ -343,8 +359,7 @@ class ValveLabelDialogTests(unittest.TestCase):
     the fields then clicking OK/Cancel - not a mock of the method itself."""
 
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_accepting_edited_labels_updates_state_and_the_valve_button(self) -> None:
         def _exec(dialog_self):
@@ -387,8 +402,7 @@ class ColorPaletteDialogTests(unittest.TestCase):
     approach as ValveLabelDialogTests."""
 
     def setUp(self) -> None:
-        self.window = ExperimentControlWindow()
-        self.addCleanup(_close_and_flush, self.window)
+        self.window = _make_window(self)
 
     def test_color_combo_starts_populated_from_the_shared_default_palette(self) -> None:
         self.assertEqual(self.window.step_color_combo.count(), len(PLAN_COLOR_OPTIONS))
@@ -437,6 +451,210 @@ class ColorPaletteDialogTests(unittest.TestCase):
             self.window._edit_color_palette_entries()
 
         self.assertEqual(self.window.step_color_combo.itemText(0), PLAN_COLOR_OPTIONS[0][0])
+
+
+class SwitchSolutionDialogTests(unittest.TestCase):
+    """_edit_switch_solution_labels - a lean 12-row QTableWidget dialog
+    (Solution column only - sLSPR acq's own dialog also has Concentration/
+    Unit/Notes columns, but nothing in this app reads them yet, so they
+    were deliberately left out rather than ported unused)."""
+
+    def setUp(self) -> None:
+        self.window = _make_window(self)
+
+    def test_switch_combo_starts_with_12_positions_all_labeled_empty(self) -> None:
+        self.assertEqual(self.window.step_switch_combo.count(), 12)
+        self.assertEqual(self.window.step_switch_combo.itemText(0), "1: empty")
+        self.assertEqual(self.window.step_switch_combo.itemText(11), "12: empty")
+
+    def test_accepting_edited_labels_updates_the_combo_text(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(2, 1, QTableWidgetItem("Buffer A"))  # position 3
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_switch_solution_labels()
+
+        self.assertEqual(self.window.step_switch_combo.itemText(2), "3: Buffer A")
+        self.assertEqual(self.window._switch_solution_labels[2], "Buffer A")
+
+    def test_cancelling_leaves_labels_unchanged(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(0, 1, QTableWidgetItem("Should not stick"))
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_switch_solution_labels()
+
+        self.assertEqual(self.window.step_switch_combo.itemText(0), "1: empty")
+
+    def test_add_step_captures_the_selected_switch_position_and_solution(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(4, 1, QTableWidgetItem("Sample 1"))  # position 5
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_switch_solution_labels()
+        self.window.step_switch_combo.setCurrentIndex(4)
+
+        self.window.plan_table.selectRow(0)
+        self.window._add_experiment_control_step_from_editor()
+        new_step = self.window._read_experiment_control_steps()[1]
+
+        self.assertEqual(new_step.switch_position, 5)
+
+    def test_position_column_is_not_editable(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            position_item = table.item(0, 0)
+            self.assertFalse(position_item.flags() & Qt.ItemFlag.ItemIsEditable)
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_switch_solution_labels()
+
+
+class PumpDisplaySettingsDialogTests(unittest.TestCase):
+    """_edit_pump_display_settings - unlike the other three dialogs added
+    this session, this one is wired to a setting with a real effect on
+    real hardware dispatch: StepCommandContext.pump_display_enabled was
+    hardcoded False before this dialog existed."""
+
+    def setUp(self) -> None:
+        self.window = _make_window(self)
+
+    def test_starts_disabled(self) -> None:
+        self.assertFalse(self.window._pump_display_enabled)
+
+    def test_accepting_checked_enables_it(self) -> None:
+        def _exec(dialog_self):
+            checkbox = dialog_self.findChild(QCheckBox)
+            checkbox.setChecked(True)
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_pump_display_settings()
+
+        self.assertTrue(self.window._pump_display_enabled)
+
+    def test_cancelling_leaves_it_unchanged(self) -> None:
+        def _exec(dialog_self):
+            dialog_self.findChild(QCheckBox).setChecked(True)
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_pump_display_settings()
+
+        self.assertFalse(self.window._pump_display_enabled)
+
+    def test_enabling_it_flows_into_the_step_command_context(self) -> None:
+        def _exec(dialog_self):
+            dialog_self.findChild(QCheckBox).setChecked(True)
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_pump_display_settings()
+
+        captured_contexts = []
+
+        def _spy(step, previous, context, *, start):
+            captured_contexts.append(context)
+            return plan_step_commands(step, previous, context, start=start)
+
+        with patch("lspri_acq_app.gui.experiment_control_window.plan_step_commands", side_effect=_spy):
+            self.window._run_experiment_control()
+            _drain_device_io()
+
+        self.assertTrue(captured_contexts)
+        self.assertTrue(captured_contexts[0].pump_display_enabled)
+
+
+class SettingsPersistenceTests(unittest.TestCase):
+    """Confirms settings actually survive across window instances, not just
+    that _save_experiment_control_settings() runs without raising - two
+    windows sharing the same (isolated, temp-file) settings path, the
+    second constructed after the first, simulating an app restart."""
+
+    def setUp(self) -> None:
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.settings_path = Path(tmp_dir.name) / "lspri_acq_settings.json"
+
+    def _make(self) -> ExperimentControlWindow:
+        return _make_window(self, settings_path=self.settings_path)
+
+    def test_valve_labels_survive_a_restart(self) -> None:
+        first = self._make()
+
+        def _exec(dialog_self):
+            dialog_self.findChildren(QLineEdit)[0].setText("Loaded")
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            first._edit_valve_state_labels()
+
+        second = self._make()
+        self.assertEqual(second._valve_state_labels["Open"], "Loaded")
+        self.assertEqual(second.step_valve_button.text(), "Loaded")
+
+    def test_color_palette_survives_a_restart(self) -> None:
+        first = self._make()
+
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(0, 0, QTableWidgetItem("Restart-safe"))
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            first._edit_color_palette_entries()
+
+        second = self._make()
+        self.assertEqual(second.step_color_combo.itemText(0), "Restart-safe")
+
+    def test_switch_solution_labels_survive_a_restart(self) -> None:
+        first = self._make()
+
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(0, 1, QTableWidgetItem("Buffer A"))
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            first._edit_switch_solution_labels()
+
+        second = self._make()
+        self.assertEqual(second._switch_solution_labels[0], "Buffer A")
+        self.assertEqual(second.step_switch_combo.itemText(0), "1: Buffer A")
+
+    def test_pump_display_enabled_survives_a_restart(self) -> None:
+        first = self._make()
+
+        def _exec(dialog_self):
+            dialog_self.findChild(QCheckBox).setChecked(True)
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            first._edit_pump_display_settings()
+
+        second = self._make()
+        self.assertTrue(second._pump_display_enabled)
+
+    def test_tube_diameter_survives_a_restart(self) -> None:
+        first = self._make()
+        distinct_mm = [option.mm for option in TUBE_DIAMETER_OPTIONS if option.mm != DEFAULT_TUBE_MM][0]
+        first.tube_diameter_spins[1].setValue(distinct_mm)
+
+        second = self._make()
+        self.assertEqual(second.tube_diameter_spins[1].value(), distinct_mm)
+        self.assertEqual(second.tube_diameter_spins[0].value(), DEFAULT_TUBE_MM)
+
+    def test_a_missing_settings_file_falls_back_to_defaults_without_raising(self) -> None:
+        window = self._make()  # settings_path does not exist yet
+        self.assertEqual(window._valve_state_labels, {"Open": "Open", "Close": "Close"})
+        self.assertEqual(len(window._color_palette_entries), len(PLAN_COLOR_OPTIONS))
 
 
 if __name__ == "__main__":
