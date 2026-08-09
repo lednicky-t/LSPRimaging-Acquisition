@@ -21,12 +21,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem
 
 from lspr_acq_shell.device_io_pool import device_io_pool
 from lspr_acq_shell.experiment_control_builders import set_step_valve_button_state_for_button
 from lspr_acq_shell.experiment_control_step_decision import plan_step_commands
-from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, DEFAULT_TUBE_MM, TUBE_DIAMETER_OPTIONS
+from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, DEFAULT_TUBE_MM, PLAN_COLOR_OPTIONS, TUBE_DIAMETER_OPTIONS
 from lspri_acq_app.gui.experiment_control_window import ExperimentControlWindow
 
 _APP = QApplication.instance() or QApplication([])
@@ -333,6 +333,110 @@ class RunHoldPauseStopIntegrationTests(unittest.TestCase):
     def test_stop_on_idle_plan_does_not_raise(self) -> None:
         self.window._stop_experiment_control()  # must not raise
         _drain_device_io()
+
+
+class ValveLabelDialogTests(unittest.TestCase):
+    """_edit_valve_state_labels - a lean QDialog (not sLSPR acq's custom
+    frameless-bordered one), same editable data. Drives the dialog by
+    patching QDialog.exec to inspect/mutate its already-constructed child
+    widgets before returning Accepted/Rejected, simulating a user editing
+    the fields then clicking OK/Cancel - not a mock of the method itself."""
+
+    def setUp(self) -> None:
+        self.window = ExperimentControlWindow()
+        self.addCleanup(_close_and_flush, self.window)
+
+    def test_accepting_edited_labels_updates_state_and_the_valve_button(self) -> None:
+        def _exec(dialog_self):
+            edits = dialog_self.findChildren(QLineEdit)
+            edits[0].setText("Loaded")
+            edits[1].setText("Sealed")
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_valve_state_labels()
+
+        self.assertEqual(self.window._valve_state_labels["Open"], "Loaded")
+        self.assertEqual(self.window._valve_state_labels["Close"], "Sealed")
+        self.assertEqual(self.window.step_valve_button.text(), "Loaded")
+
+    def test_cancelling_leaves_labels_unchanged(self) -> None:
+        def _exec(dialog_self):
+            dialog_self.findChildren(QLineEdit)[0].setText("Should not stick")
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_valve_state_labels()
+
+        self.assertEqual(self.window._valve_state_labels["Open"], "Open")
+
+    def test_blank_label_falls_back_to_the_raw_state_name(self) -> None:
+        def _exec(dialog_self):
+            dialog_self.findChildren(QLineEdit)[0].setText("   ")
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_valve_state_labels()
+
+        self.assertEqual(self.window._valve_state_labels["Open"], "Open")
+
+
+class ColorPaletteDialogTests(unittest.TestCase):
+    """_edit_color_palette_entries - a lean QDialog (QTableWidget + add/
+    remove buttons), not sLSPR acq's custom themed one. Same driving
+    approach as ValveLabelDialogTests."""
+
+    def setUp(self) -> None:
+        self.window = ExperimentControlWindow()
+        self.addCleanup(_close_and_flush, self.window)
+
+    def test_color_combo_starts_populated_from_the_shared_default_palette(self) -> None:
+        self.assertEqual(self.window.step_color_combo.count(), len(PLAN_COLOR_OPTIONS))
+
+    def test_accepting_unchanged_keeps_the_same_entries(self) -> None:
+        def _exec(dialog_self):
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_color_palette_entries()
+
+        self.assertEqual(len(self.window._color_palette_entries), len(PLAN_COLOR_OPTIONS))
+        self.assertEqual(self.window.step_color_combo.count(), len(PLAN_COLOR_OPTIONS))
+
+    def test_removing_a_row_shrinks_the_combo(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setCurrentCell(0, 0)
+            remove_button = [b for b in dialog_self.findChildren(QPushButton) if b.text() == "Remove selected"][0]
+            remove_button.click()
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_color_palette_entries()
+
+        self.assertEqual(len(self.window._color_palette_entries), len(PLAN_COLOR_OPTIONS) - 1)
+
+    def test_renaming_an_entry_is_reflected_in_the_combo(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(0, 0, QTableWidgetItem("Renamed"))
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_color_palette_entries()
+
+        self.assertEqual(self.window.step_color_combo.itemText(0), "Renamed")
+
+    def test_cancelling_leaves_the_palette_unchanged(self) -> None:
+        def _exec(dialog_self):
+            table = dialog_self.findChild(QTableWidget)
+            table.setItem(0, 0, QTableWidgetItem("Should not stick"))
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(QDialog, "exec", _exec):
+            self.window._edit_color_palette_entries()
+
+        self.assertEqual(self.window.step_color_combo.itemText(0), PLAN_COLOR_OPTIONS[0][0])
 
 
 if __name__ == "__main__":

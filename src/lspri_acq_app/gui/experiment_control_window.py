@@ -73,14 +73,22 @@ and editing controller, comparable to Tier 2's own size):
   direction (always per-channel, same simplification already made for tube
   diameter), no switch-solution combo (just the raw 1-12 spin), and the
   settings-gear buttons next to Valve/Color/Switch/Comment are present with
-  matching icons but inert (they need the not-yet-built dialog layer).
-  Tube diameter is deliberately NOT part of this row (see
-  `self.tube_diameter_spins` above) - it isn't step data at all.
+  matching icons; Valve and Color are now real (see below), Switch and
+  Comment are still inert. Tube diameter is deliberately NOT part of this
+  row (see `self.tube_diameter_spins` above) - it isn't step data at all.
+- Valve-label and color-palette editing (`step_valve_settings_button`/
+  `color_palette_button`) landed 2026-08-09 - real, working dialogs, but
+  lean standard `QDialog`s (a form with line edits + color-picker buttons;
+  a table with add/remove-row buttons), not sLSPR acq's custom frameless-
+  bordered, gradient-outlined ones (`ExperimentControlDialogs.edit_valve_labels`/
+  `edit_color_palette_entries`, ~185/~300 lines each) - same editable data
+  (label+color per valve state; name+color pairs for the palette), simpler
+  chrome. Neither persists across restarts yet (sLSPR acq saves both to its
+  UI-state file; this app has no settings-persistence story yet at all).
 - Still to come, in later sessions: the real
   `flow_plan_model.ExperimentPlanTableModel` + its 8 delegates (replacing
-  the lean `PlanTableModel` above), and the Tier-3 dialog layer (color
-  palette, valve labels, pump display settings, pause-state dialog) that
-  the settings-gear buttons above will eventually open.
+  the lean `PlanTableModel` above), the switch-solution and pump-display
+  dialogs (their gear buttons are still inert), and settings persistence.
 """
 
 from __future__ import annotations
@@ -93,14 +101,20 @@ from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
+    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -225,6 +239,12 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             channel_column.addWidget(direction_button)
             channel_columns.addLayout(channel_column)
 
+        # Valve state labels/colors - editable via step_valve_settings_button
+        # (a lean QDialog, not sLSPR acq's custom frameless-bordered one -
+        # see _edit_valve_state_labels's docstring).
+        self._valve_state_labels: dict[str, str] = {"Open": "Open", "Close": "Close"}
+        self._valve_state_colors: dict[str, str] = {"Open": "#4E79A7", "Close": "#B44A4A"}
+
         self.step_valve_button = QToolButton(self)
         self.step_valve_button.setCheckable(True)
         self.step_valve_button.setAutoRaise(True)
@@ -232,8 +252,11 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self.step_valve_button.clicked.connect(self._on_toggle_step_valve_button)
         self.step_valve_settings_button = create_flow_step_action_button(
             tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
-            "Edit the text labels used for valve states. (Not yet wired in this app.)",
+            "Edit the text labels used for valve states.",
         )
+        self.step_valve_settings_button.clicked.connect(self._edit_valve_state_labels)
+
+        self._color_palette_entries: list[tuple[str, str]] = list(PLAN_COLOR_OPTIONS)
 
         self.step_color_combo = QComboBox(self)
         self.step_color_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -241,8 +264,9 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self.step_color_combo.setToolTip("Step color used in the plan timeline for quick visual identification.")
         self.color_palette_button = create_flow_step_action_button(
             tint_tabler_icon(flow_tabler_icon("settings"), QColor("#f0f3f7")),
-            "Edit and overwrite the color palette used by the dropdown. (Not yet wired in this app.)",
+            "Edit and overwrite the color palette used by the dropdown.",
         )
+        self.color_palette_button.clicked.connect(self._edit_color_palette_entries)
 
         self.step_switch_spin = QSpinBox(self)
         self.step_switch_spin.setRange(1, 12)
@@ -773,17 +797,145 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
 
     def _populate_color_combo(self, combo: QComboBox) -> None:
         combo.clear()
-        for label, color in PLAN_COLOR_OPTIONS:
+        for label, color in self._color_palette_entries:
             combo.addItem(label, color)
 
     def _default_experiment_control_color(self, step_index: int) -> str:
-        return PLAN_COLOR_OPTIONS[step_index % len(PLAN_COLOR_OPTIONS)][1]
+        palette = self._color_palette_entries or list(PLAN_COLOR_OPTIONS)
+        return palette[step_index % len(palette)][1]
+
+    def _edit_color_palette_entries(self) -> None:
+        """Edit the name/color entries offered in the step-color dropdown.
+
+        A lean standard QDialog (a QTableWidget with name/color-button rows
+        plus add/remove buttons), not sLSPR acq's custom frameless-bordered,
+        gradient-outlined one (`ExperimentControlDialogs.edit_color_palette_entries`,
+        ~300 lines) - same editable data (name + color pairs), simpler
+        chrome. Part of the staged visual-parity effort's dialog-layer slice.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Color palette")
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(len(self._color_palette_entries), 2, dialog)
+        table.setHorizontalHeaderLabels(["Name", "Color"])
+        table.horizontalHeader().setStretchLastSection(True)
+
+        def _add_row(row: int, name: str, color: str) -> None:
+            table.setItem(row, 0, QTableWidgetItem(name))
+            color_button = QPushButton(color, dialog)
+
+            def _pick(_checked: bool = False, r: int = row) -> None:
+                current = table.cellWidget(r, 1)
+                chosen = QColorDialog.getColor(QColor(current.text()), dialog, "Palette color")
+                if chosen.isValid():
+                    current.setText(chosen.name().upper())
+
+            color_button.clicked.connect(_pick)
+            table.setCellWidget(row, 1, color_button)
+
+        for row, (name, color) in enumerate(self._color_palette_entries):
+            _add_row(row, name, color)
+        layout.addWidget(table)
+
+        row_buttons = QHBoxLayout()
+        add_row_button = QPushButton("Add color", dialog)
+        remove_row_button = QPushButton("Remove selected", dialog)
+        row_buttons.addWidget(add_row_button)
+        row_buttons.addWidget(remove_row_button)
+        layout.addLayout(row_buttons)
+
+        def _on_add_row() -> None:
+            table.insertRow(table.rowCount())
+            _add_row(table.rowCount() - 1, f"Custom {table.rowCount()}", "#4E79A7")
+
+        def _on_remove_row() -> None:
+            row = table.currentRow()
+            if row >= 0:
+                table.removeRow(row)
+
+        add_row_button.clicked.connect(_on_add_row)
+        remove_row_button.clicked.connect(_on_remove_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entries: list[tuple[str, str]] = []
+        for row in range(table.rowCount()):
+            name_item = table.item(row, 0)
+            color_button = table.cellWidget(row, 1)
+            name = (name_item.text().strip() if name_item is not None else "") or f"Custom {row + 1}"
+            color = QColor(color_button.text() if color_button is not None else "")
+            if color.isValid():
+                entries.append((name, color.name().upper()))
+        if not entries:
+            entries = list(PLAN_COLOR_OPTIONS)
+        self._color_palette_entries = entries
+        current_color = str(self.step_color_combo.currentData() or "")
+        self._populate_color_combo(self.step_color_combo)
+        restored_index = self.step_color_combo.findData(current_color)
+        if restored_index >= 0:
+            self.step_color_combo.setCurrentIndex(restored_index)
 
     def _valve_state_label(self, valve: str) -> str:
-        # No custom valve-label editing yet (that needs the not-yet-wired
-        # settings dialog - see step_valve_settings_button) - always the raw
-        # Open/Close state.
-        return "Close" if str(valve or "").strip().lower() == "close" else "Open"
+        normalized = "Close" if str(valve or "").strip().lower() == "close" else "Open"
+        label = str(self._valve_state_labels.get(normalized, normalized)).strip()
+        return label or normalized
+
+    def _edit_valve_state_labels(self) -> None:
+        """Edit the display text/color shown for the Open/Close valve states.
+
+        A lean standard QDialog, not sLSPR acq's custom frameless-bordered
+        one with its own themed color-picker table widget
+        (`ExperimentControlDialogs.edit_valve_labels`, ~185 lines) - same
+        editable data (a label + a color per state), simpler chrome. Part of
+        the staged visual-parity effort's dialog-layer slice.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Valve labels")
+        form = QFormLayout(dialog)
+
+        label_edits: dict[str, QLineEdit] = {}
+        color_buttons: dict[str, QPushButton] = {}
+        chosen_colors = dict(self._valve_state_colors)
+
+        def _make_color_picker(state: str) -> QPushButton:
+            button = QPushButton(chosen_colors[state], dialog)
+
+            def _pick() -> None:
+                color = QColorDialog.getColor(QColor(chosen_colors[state]), dialog, f"{state} color")
+                if color.isValid():
+                    chosen_colors[state] = color.name().upper()
+                    button.setText(chosen_colors[state])
+
+            button.clicked.connect(_pick)
+            return button
+
+        for state in ("Open", "Close"):
+            edit = QLineEdit(self._valve_state_labels.get(state, state), dialog)
+            label_edits[state] = edit
+            color_button = _make_color_picker(state)
+            color_buttons[state] = color_button
+            row = QHBoxLayout()
+            row.addWidget(edit)
+            row.addWidget(color_button)
+            form.addRow(f"{state}:", row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._valve_state_labels = {state: label_edits[state].text().strip() or state for state in ("Open", "Close")}
+        self._valve_state_colors = chosen_colors
+        current = str(self.step_valve_button.property("valve") or "Open")
+        set_step_valve_button_state_for_button(self, self.step_valve_button, current)
 
     def _on_toggle_step_valve_button(self) -> None:
         current = str(self.step_valve_button.property("valve") or "Open")
