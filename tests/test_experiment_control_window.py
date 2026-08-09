@@ -19,10 +19,13 @@ actually connected, just report status messages saying so.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from PyQt6.QtWidgets import QApplication
 
 from lspr_acq_shell.device_io_pool import device_io_pool
+from lspr_acq_shell.experiment_control_step_decision import plan_step_commands
+from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, DEFAULT_TUBE_MM, TUBE_DIAMETER_OPTIONS
 from lspri_acq_app.gui.experiment_control_window import ExperimentControlWindow
 
 _APP = QApplication.instance() or QApplication([])
@@ -59,6 +62,105 @@ class ExperimentControlWindowConstructionTests(unittest.TestCase):
 
     def test_plan_table_row_count_matches_steps(self) -> None:
         self.assertEqual(self.window.plan_table.rowCount(), 1)
+
+    def test_one_tube_diameter_control_per_channel_defaulting_to_default_tube_mm(self) -> None:
+        self.assertEqual(len(self.window.tube_diameter_spins), ACTIVE_PUMP_CHANNELS)
+        for spin in self.window.tube_diameter_spins:
+            self.assertEqual(spin.value(), DEFAULT_TUBE_MM)
+
+    def test_pause_template_starts_as_a_single_all_stop_row(self) -> None:
+        self.assertEqual(self.window.pause_template_table.rowCount(), 1)
+        pause_step = self.window._pause_row_step()
+        self.assertEqual(pause_step.valve, "Close")
+        self.assertTrue(all(channel.flow_ul_min == 0.0 for channel in pause_step.channels))
+
+
+class PauseTemplateEditingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.window = ExperimentControlWindow()
+        self.addCleanup(_close_and_flush, self.window)
+
+    def test_editing_the_pause_template_table_changes_what_pause_row_step_returns(self) -> None:
+        model = self.window._pause_template_model
+        model.setData(model.index(0, 2), "Open")  # valve column
+        model.setData(model.index(0, 4), "35")  # CH1 flow column
+
+        pause_step = self.window._pause_row_step()
+
+        self.assertEqual(pause_step.valve, "Open")
+        self.assertEqual(pause_step.channels[0].flow_ul_min, 35.0)
+
+    def test_pause_row_step_returns_a_deepcopy_not_the_live_template(self) -> None:
+        first = self.window._pause_row_step()
+        first.valve = "mutated"
+        self.assertNotEqual(self.window._pause_row_step().valve, "mutated")
+
+    def test_editing_the_pause_template_does_not_affect_the_main_plan_table(self) -> None:
+        # Default main-table step already starts with valve="Open" - use a
+        # comment string instead, which starts empty on the main step, to
+        # actually distinguish "isolated" from "coincidentally the same".
+        model = self.window._pause_template_model
+        model.setData(model.index(0, 13), "pause-only comment")  # comment column
+        self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
+        self.assertNotEqual(self.window._read_experiment_control_steps()[0].description, "pause-only comment")
+
+    def test_pause_uses_the_edited_template_when_actually_pausing(self) -> None:
+        model = self.window._pause_template_model
+        model.setData(model.index(0, 2), "Open")
+        model.setData(model.index(0, 4), "42")
+
+        self.window._run_experiment_control()
+        _drain_device_io()
+
+        captured_steps = []
+
+        def _spy(step, previous, context, *, start):
+            if not start:
+                captured_steps.append(step)
+            return plan_step_commands(step, previous, context, start=start)
+
+        with patch("lspri_acq_app.gui.experiment_control_window.plan_step_commands", side_effect=_spy):
+            self.window._pause_experiment_control()
+            _drain_device_io()
+
+        self.window._stop_experiment_control()
+        _drain_device_io()
+
+        self.assertTrue(captured_steps)
+        self.assertEqual(captured_steps[0].valve, "Open")
+        self.assertEqual(captured_steps[0].channels[0].flow_ul_min, 42.0)
+
+
+class TubeDiameterWiringTests(unittest.TestCase):
+    """Confirms a tube-diameter combobox's value actually reaches the shared
+    plan_step_commands() decision function - not just that the widgets
+    exist, since a disconnected pump (no hardware in this environment)
+    means no pump.set_flow command is ever built to inspect the value in,
+    so the wiring itself is what's asserted here, via the same
+    StepCommandContext plan_step_commands() is always called with."""
+
+    def setUp(self) -> None:
+        self.window = ExperimentControlWindow()
+        self.addCleanup(_close_and_flush, self.window)
+
+    def test_changed_tube_diameter_flows_into_the_step_command_context(self) -> None:
+        distinct_mm = [option.mm for option in TUBE_DIAMETER_OPTIONS if option.mm != DEFAULT_TUBE_MM][0]
+        self.window.tube_diameter_spins[2].setValue(distinct_mm)
+        expected = [spin.value() for spin in self.window.tube_diameter_spins]
+        self.assertEqual(expected[2], distinct_mm)
+
+        captured_contexts = []
+
+        def _spy(step, previous, context, *, start):
+            captured_contexts.append(context)
+            return plan_step_commands(step, previous, context, start=start)
+
+        with patch("lspri_acq_app.gui.experiment_control_window.plan_step_commands", side_effect=_spy):
+            self.window._run_experiment_control()
+            _drain_device_io()
+
+        self.assertTrue(captured_contexts)
+        self.assertEqual(captured_contexts[0].tube_mm_by_channel, expected)
 
 
 class StepEditingTests(unittest.TestCase):

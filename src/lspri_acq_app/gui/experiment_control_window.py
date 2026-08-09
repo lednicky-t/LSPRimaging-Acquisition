@@ -28,14 +28,23 @@ parity - see the 2026-08-09 build-log entry for the scope decision):
   + its window-coupled dropdown-picker delegates - that layer wasn't traced
   as safely shareable without real redesign work (Tier-3-equivalent), and
   wasn't needed for a first working panel.
-  - No manual tube-diameter-per-channel control yet: `plan_step_commands`
-    needs a `tube_mm_by_channel` list; this window supplies
-    `[DEFAULT_TUBE_MM] * ACTIVE_PUMP_CHANNELS` as a fixed default
-    (0.25 mm, the same default sLSPR acq's own manual-tube spinboxes start
-    at) rather than exposing per-channel controls.
-  - No editable "pause row" template (sLSPR acq lets the user configure
-    what HOLD/PAUSE actually sends to the pump) - `_pause_row_step()`
-    returns a fixed all-stop template.
+  - Per-channel tube diameter IS controlled the same way as sLSPR acq -
+    one `TubeDiameterComboBox` per channel (`self.tube_diameter_spins`,
+    same shared widget from Tier 1), feeding `plan_step_commands`'
+    `tube_mm_by_channel`. Simplified relative to sLSPR acq's version: no
+    "uniform" toggle button that drives all four channels from one control
+    (sLSPR acq's `manual_uniform_button`) - always independent per-channel
+    controls here. Added 2026-08-09.
+  - The pause-state template (what PAUSE actually sends to the pump/valve/
+    selector) IS editable, same as sLSPR acq - but via a second, tiny
+    one-row instance of the same `PlanTableModel`/`ExperimentControlTableView`
+    (`self.pause_template_table`/`self._pause_template_model`), not sLSPR
+    acq's dedicated themed `QDialog` (`ExperimentControlDialogs.edit_pause_state`,
+    part of the not-shared Tier-3 dialog layer) - same editable fields
+    (duration/valve/switch/4 channels/color/comment), reusing what already
+    exists rather than porting a whole new dialog. `duration_s` is stored
+    but unused (the pause step is applied once via `_apply_step_to_pump_async`,
+    not run through the timer). Added 2026-08-09.
   - No recording/HDF5 integration - `_request_recording_control` always
     succeeds and `_emit_experimental_control_state` only logs, since the
     sweep-pipeline/session-recording flow for this app is a separate,
@@ -46,6 +55,7 @@ parity - see the 2026-08-09 build-log entry for the scope decision):
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Callable
 
 from PyQt6.QtCore import QTimer
@@ -67,8 +77,8 @@ from lspr_acq_shell.experiment_control_run_loop import PlanRunLoopMixin
 from lspr_acq_shell.experiment_control_step_decision import StepCommandContext, plan_step_commands
 from lspr_acq_shell.experiment_control_step_runner import _StepApplyResult, _StepApplyRunnable
 from lspr_acq_shell.experiment_control_timeline import PumpPlanTimelineWidget
-from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, PlanColorDelegate
-from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, DEFAULT_TUBE_MM, PumpChannelStep, PumpPlanStep, recompute_plan_timing
+from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, PlanColorDelegate, TubeDiameterComboBox
+from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PumpChannelStep, PumpPlanStep, recompute_plan_timing
 
 from lspri_acq_app.gui.plan_table_model import PlanTableModel
 
@@ -133,6 +143,33 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
 
         self.timeline_widget = PumpPlanTimelineWidget(self)
 
+        self.tube_diameter_spins: list[TubeDiameterComboBox] = []
+        tube_row = QHBoxLayout()
+        tube_row.addWidget(QLabel("Tube diameter (mm):", self))
+        for channel in range(1, ACTIVE_PUMP_CHANNELS + 1):
+            tube_row.addWidget(QLabel(f"CH{channel}", self))
+            spin = TubeDiameterComboBox(self)
+            spin.setToolTip(f"Tubing inner diameter for CH{channel} in mm. Only the pump's supported sizes are selectable.")
+            self.tube_diameter_spins.append(spin)
+            tube_row.addWidget(spin)
+        tube_row.addStretch(1)
+
+        # Pause template: what gets sent to the pump/valve/selector when
+        # Pause is clicked - reuses the exact same table/model/color-delegate
+        # machinery as the main plan table (see module docstring) rather
+        # than a dedicated dialog, since it's just editing another
+        # PumpPlanStep.
+        self._pause_template_model = PlanTableModel([_default_pause_step()])
+        self.pause_template_table = ExperimentControlTableView(self)
+        self.pause_template_table.setModel(self._pause_template_model)
+        self.pause_template_table.setProperty("experiment_control_edit_mode", True)
+        self.pause_template_table.setItemDelegateForColumn(_COLOR_COLUMN, PlanColorDelegate(self.pause_template_table))
+        self.pause_template_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.pause_template_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.pause_template_table.setFixedHeight(64)
+        self.pause_template_table.setToolTip("What the pump/valve/selector are set to when Pause is clicked.")
+        pause_label = QLabel("Pause state (sent when Pause is clicked):", self)
+
         self.status_label = QLabel("Ready.", self)
 
         self.run_button = QPushButton("Run", self)
@@ -163,7 +200,10 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(toolbar)
+        layout.addLayout(tube_row)
         layout.addWidget(self.plan_table, 1)
+        layout.addWidget(pause_label)
+        layout.addWidget(self.pause_template_table)
         layout.addWidget(self.timeline_widget)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
@@ -217,7 +257,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             pump_connected=self._service_device_connected(PUMP),
             valve_connected=self._service_device_connected(SWITCH),
             mswitch_connected=self._service_device_connected(SELECTOR),
-            tube_mm_by_channel=[DEFAULT_TUBE_MM] * ACTIVE_PUMP_CHANNELS,
+            tube_mm_by_channel=[spin.value() for spin in self.tube_diameter_spins],
             pump_backsteps=0,
             pump_roller_count=8,
             pump_display_enabled=False,
@@ -311,12 +351,10 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._set_status_message("Experiment plan stopped.")
 
     def _pause_row_step(self) -> PumpPlanStep:
-        # A fixed all-stop template, not user-configurable yet (see module
-        # docstring) - closes the valve state and stops every channel.
-        return PumpPlanStep(
-            step=0, duration_s=0.0, color="#B44A4A", valve="Close", switch_position=1,
-            description="Pause", channels=[PumpChannelStep() for _ in range(ACTIVE_PUMP_CHANNELS)],
-        )
+        # Live-edited via self.pause_template_table/self._pause_template_model
+        # (see module docstring) - a deepcopy so external code can't mutate
+        # the template through the returned step.
+        return deepcopy(self._pause_template_model.steps()[0])
 
     def _request_recording_control(self, action: str) -> bool:
         # No session-recording flow for this app yet (see module docstring).
@@ -369,3 +407,14 @@ def _default_plan_steps() -> list[PumpPlanStep]:
             channels=[PumpChannelStep() for _ in range(ACTIVE_PUMP_CHANNELS)],
         )
     ]
+
+
+def _default_pause_step() -> PumpPlanStep:
+    # All-stop starting point, matching sLSPR acq's own default pause
+    # template (experiment_control_window.py's _experiment_control_pause_template) -
+    # closes the valve and stops every channel. Fully editable afterward via
+    # self.pause_template_table, unlike the fixed template this replaced.
+    return PumpPlanStep(
+        step=0, duration_s=0.0, color="#B44A4A", valve="Close", switch_position=1,
+        description="Pause", channels=[PumpChannelStep() for _ in range(ACTIVE_PUMP_CHANNELS)],
+    )
