@@ -18,38 +18,57 @@ Built from the shared pieces landed across Tiers 0-2 of that extraction:
 - `lspr_acq_shell.experiment_control_run_loop.PlanRunLoopMixin` - the
   run/hold/pause/stop state machine itself (Tier 2)
 - `lspr_acq_shell.device_io_pool` - the single-lane device-command thread pool
+- `lspr_acq_shell.experiment_plan_table_model`/`experiment_control_plan_view`/
+  `experiment_control_table` - the *real* `ExperimentPlanTableModel` + its 8
+  delegates, and the functions that wire them onto a `QTableView`
+  (Tier 3a, 2026-08-10 - see below).
 
-What's deliberately NOT reused/built yet (a first working panel, not full
-parity - see the 2026-08-09 build-log entry for the scope decision):
+**Tier 3a migration (2026-08-10)**: this window used to have its own lean
+`gui.plan_table_model.PlanTableModel` (plain Qt text/combo editing) plus 3
+lean delegates, because porting sLSPR acq's real, window-coupled delegates
+wasn't traced as safely shareable at the time. That trace has since been
+redone properly (see the 2026-08-10 build-log entry) and the real model +
+all 8 delegates were moved into `lspr_acq_shell` and are now used here
+directly - `gui/plan_table_model.py` is retired, not just superseded. The
+one real consequence: `ExperimentPlanTableModel` has no
+insert_step/duplicate_step/remove_step/move_step of its own (unlike the
+retired lean model) - this window now owns the canonical step list itself
+and pushes it back via `set_steps()` after each edit, the same ownership
+model sLSPR acq's own window already used. Per-column helpers
+(`_flow_rate_column`/`_valve_column`/etc.), `_color_combo_popup_width`/
+`_update_color_combo_style` (ported from sLSPR acq's window), and a
+documented no-op `_install_table_wheel_scroll_filter` (the wheel-scroll
+cell-cycling subsystem itself isn't shared yet - plan doc §14.3) satisfy the
+delegates' full host contract.
 
-- The plan table's cell-editing model: this window uses a new, lean
-  `gui.plan_table_model.PlanTableModel` (plain Qt text/combo editing)
-  instead of sLSPR acq's 1,123-line `flow_plan_model.ExperimentPlanTableModel`
-  + its window-coupled dropdown-picker delegates - that layer wasn't traced
-  as safely shareable without real redesign work (Tier-3-equivalent), and
-  wasn't needed for a first working panel.
-  - Per-channel tube diameter IS controlled the same way as sLSPR acq -
-    one `TubeDiameterComboBox` per channel (`self.tube_diameter_spins`,
-    same shared widget from Tier 1), feeding `plan_step_commands`'
-    `tube_mm_by_channel`. Simplified relative to sLSPR acq's version: no
-    "uniform" toggle button that drives all four channels from one control
-    (sLSPR acq's `manual_uniform_button`) - always independent per-channel
-    controls here. Added 2026-08-09.
-  - The pause-state template (what PAUSE actually sends to the pump/valve/
-    selector) IS editable, same as sLSPR acq - but via a second, tiny
-    one-row instance of the same `PlanTableModel`/`ExperimentControlTableView`
-    (`self.pause_template_table`/`self._pause_template_model`), not sLSPR
-    acq's dedicated themed `QDialog` (`ExperimentControlDialogs.edit_pause_state`,
-    part of the not-shared Tier-3 dialog layer) - same editable fields
-    (duration/valve/switch/4 channels/color/comment), reusing what already
-    exists rather than porting a whole new dialog. `duration_s` is stored
-    but unused (the pause step is applied once via `_apply_step_to_pump_async`,
-    not run through the timer). Added 2026-08-09.
-  - No recording/HDF5 integration - `_request_recording_control` always
-    succeeds and `_emit_experimental_control_state` only logs, since the
-    sweep-pipeline/session-recording flow for this app is a separate,
-    not-yet-built milestone. Running the plan drives real pump/valve/
-    selector hardware; it does not yet log a session file.
+What's still deliberately NOT reused/built yet (see the 2026-08-09 build-log
+entry for the original scope decision, and the plan doc's §14 for what's
+left of the full-parity effort):
+
+- Per-channel tube diameter IS controlled the same way as sLSPR acq -
+  one `TubeDiameterComboBox` per channel (`self.tube_diameter_spins`,
+  aliased as `self.manual_tube_spins` for the shared wiring code), feeding
+  `plan_step_commands`' `tube_mm_by_channel`. Simplified relative to sLSPR
+  acq's version: no "uniform" toggle button that drives all four channels
+  from one control (sLSPR acq's `manual_uniform_button`) - always
+  independent per-channel controls here.
+- The pause-state template (what PAUSE actually sends to the pump/valve/
+  selector) IS editable, same as sLSPR acq - but as an embedded one-row
+  table (`self.pause_template_table`/`self._pause_template_model`, built via
+  `build_experiment_control_pause_model()` - the same function sLSPR acq's
+  own popup pause dialog uses internally), not sLSPR acq's dedicated themed
+  `QDialog` (`ExperimentControlDialogs.edit_pause_state`) - still a real,
+  deliberate UX difference, now backed by the real shared model instead of a
+  lean one.
+- No column-width/hide/compact-mode logic (`configure_experiment_control_table_columns`,
+  a separate function from the model/delegate wiring used here) - every
+  column is shown at its default width; sLSPR acq's viewport-fit-width and
+  detail-toggle behavior isn't wired up.
+- No recording/HDF5 integration - `_request_recording_control` always
+  succeeds and `_emit_experimental_control_state` only logs, since the
+  sweep-pipeline/session-recording flow for this app is a separate,
+  not-yet-built milestone. Running the plan drives real pump/valve/
+  selector hardware; it does not yet log a session file.
 
 Visual-parity effort (started 2026-08-09, per explicit maintainer request to
 match sLSPR acq's look/behavior - staged across sessions given the true
@@ -124,24 +143,14 @@ and editing controller, comparable to Tier 2's own size):
   are not (sLSPR acq's importer does merge those; skipped here as a further
   simplification, since nothing exercises that path without real HDF5
   measurement files from this app to import from anyway).
-- Real per-cell delegates landed 2026-08-09, closing the last item from the
-  visual-parity punch list - but not by porting sLSPR acq's
-  `flow_plan_model.ExperimentPlanTableModel` + its 8 delegate classes.
-  Traced that file first: the *model* class there takes no `window`
-  reference at all (configured via plain setters), so it's genuinely
-  portable - but this window's own `gui.plan_table_model.PlanTableModel`
-  already has 58+ tests built around its own (different) column layout, so
-  swapping in the real model would have meant reworking column indices and
-  delegate wiring across already-working, tested code for uncertain
-  benefit. The actual complexity is entirely in the 8 delegates, which
-  *are* deeply `window`-coupled (event filters, wheel-scroll suppression,
-  auto-opening popups, exact popup-width calculations). Built 3 lean, real
-  delegates instead (`ValveDelegate`/`SwitchSolutionDelegate`/
-  `DirectionDelegate` in `gui/plan_table_model.py`) from pieces already in
-  this window (`_valve_state_label`, `_switch_display_text`,
-  `direction_glyph`) - real dropdown editors and `displayText()` overrides
-  for friendly read-only rendering, no custom popup sizing/wheel-scroll/
-  auto-open behavior. `PlanColorDelegate` (Tier 1) was already wired.
+- Real per-cell delegates landed 2026-08-09 as 3 lean, window-specific
+  delegates (`ValveDelegate`/`SwitchSolutionDelegate`/`DirectionDelegate` in
+  the now-retired `gui/plan_table_model.py`) - **superseded 2026-08-10 by
+  Tier 3a**, which moved sLSPR acq's real 8 delegates into `lspr_acq_shell`
+  and switched this window to them directly (see above). The lean delegates'
+  `displayText()`-based friendly rendering is now the real delegates' own
+  `paint()`-based rendering instead - same information, sLSPR acq's actual
+  visuals rather than an approximation of them.
 """
 
 from __future__ import annotations
@@ -200,21 +209,18 @@ from lspr_acq_shell.experiment_control_run_loop import PlanRunLoopMixin
 from lspr_acq_shell.experiment_control_step_decision import StepCommandContext, plan_step_commands
 from lspr_acq_shell.experiment_control_step_runner import _StepApplyResult, _StepApplyRunnable
 from lspr_acq_shell.experiment_control_timeline import PumpPlanTimelineWidget
-from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, PlanColorDelegate, TubeDiameterComboBox
+from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, TubeDiameterComboBox
+from lspr_acq_shell.experiment_control_plan_view import (
+    build_experiment_control_pause_model,
+    configure_experiment_control_plan_preview,
+)
+from lspr_acq_shell.experiment_control_table import configure_experiment_control_plan_table
+from lspr_acq_shell.experiment_plan_table_model import _contrast_text_color
 from lspr_acq_shell.pump_plan import ACTIVE_PUMP_CHANNELS, PLAN_COLOR_OPTIONS, PumpChannelStep, PumpPlanStep, recompute_plan_timing
 from lspr_acq_shell.settings_store import load_app_setting, save_app_setting
 from lspr_acq_shell.user_profile import current_config_path
 
-from lspri_acq_app.gui.plan_table_model import (
-    COLUMN_CHANNEL_DIRECTION_START,
-    COLUMN_COLOR,
-    COLUMN_SWITCH,
-    COLUMN_VALVE,
-    DirectionDelegate,
-    PlanTableModel,
-    SwitchSolutionDelegate,
-    ValveDelegate,
-)
+from lspri_acq_app.version import APP_NAME, APP_VERSION
 
 _LOGGER = logging.getLogger("lspri_acq_app.experiment_control")
 
@@ -436,17 +442,6 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         editor_row.setColumnStretch(4, 1)
         editor_row.addLayout(channel_columns, 0, 5, 2, 1)
 
-        self._table_model = PlanTableModel(recompute_plan_timing(_default_plan_steps()))
-        self.plan_table = ExperimentControlTableView(self)
-        self.plan_table.setModel(self._table_model)
-        self.plan_table.setProperty("experiment_control_edit_mode", True)
-        self._install_plan_table_delegates(self.plan_table)
-        self.plan_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.plan_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.plan_table.step_move_requested.connect(self._on_step_move_requested)
-
-        self.timeline_widget = PumpPlanTimelineWidget(self)
-
         persisted_tube_mm = self._persisted_settings.get("tube_mm_by_channel")
         if not (isinstance(persisted_tube_mm, list) and len(persisted_tube_mm) == ACTIVE_PUMP_CHANNELS):
             persisted_tube_mm = None
@@ -463,21 +458,50 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             self.tube_diameter_spins.append(spin)
             tube_row.addWidget(spin)
         tube_row.addStretch(1)
+        # configure_experiment_control_plan_view (Tier 3a) reads
+        # window.manual_tube_spins, sLSPR acq's own attribute name for the
+        # same thing - an alias rather than a rename so tube_diameter_spins
+        # (used throughout the rest of this file already) doesn't have to
+        # change everywhere.
+        self.manual_tube_spins = self.tube_diameter_spins
+
+        # PLAN_COLUMNS: only its *length* matters here (4 + ACTIVE_PUMP_CHANNELS*3 + 4 -
+        # step/duration/start/end, 3 fields per channel, valve/switch/color/comment) -
+        # build_experiment_control_headers() (called inside
+        # configure_experiment_control_plan_table/_pause_model below) overwrites every
+        # entry's text itself.
+        self.PLAN_COLUMNS = ["column"] * (4 + ACTIVE_PUMP_CHANNELS * 3 + 4)
+
+        self.plan_table = ExperimentControlTableView(self)
+        self.plan_table.setProperty("experiment_control_edit_mode", True)
+        self.plan_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plan_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.plan_table.step_move_requested.connect(self._on_step_move_requested)
+        # The real shared table model/delegates (Tier 3a, 2026-08-10) - the
+        # same ExperimentPlanTableModel + 8 delegates sLSPR acq's own window
+        # uses, not a separate lean copy (see module docstring).
+        self._table_model = configure_experiment_control_plan_table(self, app_name=APP_NAME, app_version=APP_VERSION)
+        self._table_model.set_steps(recompute_plan_timing(_default_plan_steps()))
+
+        self.timeline_widget = PumpPlanTimelineWidget(self)
 
         # Pause template: what gets sent to the pump/valve/selector when
-        # Pause is clicked - reuses the exact same table/model/color-delegate
-        # machinery as the main plan table (see module docstring) rather
-        # than a dedicated dialog, since it's just editing another
-        # PumpPlanStep.
-        self._pause_template_model = PlanTableModel([_default_pause_step()])
+        # Pause is clicked - an embedded one-row table (built via the same
+        # build_experiment_control_pause_model() sLSPR acq's own popup pause
+        # dialog uses internally) rather than a popup dialog, a deliberate,
+        # still-standing simplification (see module docstring) - now backed
+        # by the real shared model/delegates rather than a lean copy.
         self.pause_template_table = ExperimentControlTableView(self)
-        self.pause_template_table.setModel(self._pause_template_model)
         self.pause_template_table.setProperty("experiment_control_edit_mode", True)
-        self._install_plan_table_delegates(self.pause_template_table)
         self.pause_template_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.pause_template_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.pause_template_table.setFixedHeight(64)
         self.pause_template_table.setToolTip("What the pump/valve/selector are set to when Pause is clicked.")
+        self._pause_template_model = build_experiment_control_pause_model(
+            self, _default_pause_step(), app_name=APP_NAME, app_version=APP_VERSION
+        )
+        self.pause_template_table.setModel(self._pause_template_model)
+        configure_experiment_control_plan_preview(self, self.pause_template_table, self._pause_template_model)
         pause_label = QLabel("Pause state (sent when Pause is clicked):", self)
 
         self.status_label = QLabel("Ready.", self)
@@ -1055,18 +1079,69 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
     def _run_gui_callback_timed(self, label: str, callback: Callable[[], None]) -> None:
         callback()
 
-    def _install_plan_table_delegates(self, table: ExperimentControlTableView) -> None:
-        """Real per-cell delegates (dropdown pickers, not plain text entry)
-        for the plan table and the pause-template table - both use the same
-        `PlanTableModel` column layout. See this module's `plan_table_model`
-        import and that file's docstring for why these are lean equivalents
-        of sLSPR acq's delegates, not ports of them."""
-        table.setItemDelegateForColumn(COLUMN_VALVE, ValveDelegate(self, table))
-        table.setItemDelegateForColumn(COLUMN_SWITCH, SwitchSolutionDelegate(self, table))
-        direction_delegate = DirectionDelegate(table)
-        for channel_index in range(ACTIVE_PUMP_CHANNELS):
-            table.setItemDelegateForColumn(COLUMN_CHANNEL_DIRECTION_START + channel_index, direction_delegate)
-        table.setItemDelegateForColumn(COLUMN_COLOR, PlanColorDelegate(table))
+    # ═══════════════════════════════════════════════════════════════════
+    # ExperimentPlanTableModel/delegate host contract (Tier 3a, 2026-08-10)
+    # Column-index helpers match the shared model's own column arithmetic
+    # exactly (4 + ACTIVE_PUMP_CHANNELS*3 leading columns, then
+    # valve/switch/color/description) - see experiment_plan_table_model.py.
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _flow_rate_column(self, channel_index: int) -> int:
+        return 4 + channel_index * 3
+
+    def _direction_column(self, channel_index: int) -> int:
+        return 4 + channel_index * 3 + 1
+
+    def _tube_column(self, channel_index: int) -> int:
+        return 4 + channel_index * 3 + 2
+
+    def _valve_column(self) -> int:
+        return 4 + ACTIVE_PUMP_CHANNELS * 3
+
+    def _switch_column(self) -> int:
+        return self._valve_column() + 1
+
+    def _color_column(self) -> int:
+        return self._valve_column() + 2
+
+    def _description_column(self) -> int:
+        return self._valve_column() + 3
+
+    def _color_combo_popup_width(self, combo: QComboBox) -> int:
+        metrics = combo.fontMetrics()
+        widest = max((metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())), default=0)
+        return max(int(combo.width()), widest + 48)
+
+    def _update_color_combo_style(self, combo: QComboBox) -> None:
+        color = combo.currentData()
+        if not isinstance(color, str) or not color:
+            combo.setStyleSheet("")
+            return
+        text_color = _contrast_text_color(color)
+        line_edit = combo.lineEdit()
+        if line_edit is not None:
+            line_edit.setStyleSheet(
+                "QLineEdit {"
+                f" background-color: {color}; color: {text_color};"
+                " border: none; border-radius: 10px; padding: 0px; margin: 0px;"
+                "}"
+            )
+        combo.setStyleSheet(
+            "QComboBox {"
+            f" background: {color}; color: {text_color};"
+            f" border: 1px solid {color}; border-radius: 10px; padding: 0px 1px;"
+            "}"
+        )
+
+    def _install_table_wheel_scroll_filter(self, widget: QWidget | None) -> None:
+        """No-op here: sLSPR acq's wheel-scroll cell cycling lives in its own
+        `eventFilter()` override (a genuinely separate, not-yet-shared
+        subsystem - see the plan doc's §14.3 "spreadsheet-style cell
+        navigation/editing" item), which this window doesn't have. Still a
+        required call in the shared delegates' `_prepare_editor()` - safe to
+        no-op since this window doesn't override `eventFilter` either, so
+        `installEventFilter(self)` would do nothing anyway."""
+        return
 
     # ═══════════════════════════════════════════════════════════════════
     # Settings persistence
@@ -1128,7 +1203,25 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
             padded += [""] * max(0, 12 - len(padded))
             self._switch_solution_labels = padded
             self._populate_switch_solution_combo(self.step_switch_combo, self.step_switch_combo.currentData())
+        self._sync_table_models_display_state()
         self._save_experiment_control_settings()
+
+    def _sync_table_models_display_state(self) -> None:
+        """Push valve-label/color-palette/switch-solution state into both
+        ExperimentPlanTableModel instances (the main plan table and the
+        pause-template table each own their own copy - see
+        experiment_plan_table_model.py's module docstring). Needed because
+        (unlike the retired lean PlanTableModel, whose delegates read
+        window._valve_state_label() etc. fresh on every paint) the real
+        model caches this state internally via explicit setters - call this
+        after any edit to self._valve_state_labels/_colors,
+        self._color_palette_entries, or self._switch_solution_labels so the
+        table actually reflects it."""
+        for model in (self._table_model, self._pause_template_model):
+            model.set_valve_state_labels(self._valve_state_labels)
+            model.set_valve_state_colors(self._valve_state_colors)
+            model.set_color_options(self._color_palette_entries)
+            model.set_switch_solution_labels(self._switch_solution_labels)
 
     # ═══════════════════════════════════════════════════════════════════
     # Toolbar actions
@@ -1212,6 +1305,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._switch_solution_labels = labels
         current_position = self._current_switch_position_from_editor()
         self._populate_switch_solution_combo(self.step_switch_combo, current_position)
+        self._sync_table_models_display_state()
         self._save_experiment_control_settings()
 
     def _edit_pump_display_settings(self) -> None:
@@ -1332,6 +1426,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         restored_index = self.step_color_combo.findData(current_color)
         if restored_index >= 0:
             self.step_color_combo.setCurrentIndex(restored_index)
+        self._sync_table_models_display_state()
         self._save_experiment_control_settings()
 
     def _valve_state_label(self, valve: str) -> str:
@@ -1389,6 +1484,7 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         self._valve_state_colors = chosen_colors
         current = str(self.step_valve_button.property("valve") or "Open")
         set_step_valve_button_state_for_button(self, self.step_valve_button, current)
+        self._sync_table_models_display_state()
         self._save_experiment_control_settings()
 
     def _on_toggle_step_valve_button(self) -> None:
@@ -1422,37 +1518,59 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         next_direction = "CCW" if self._direction_button_value(button) == "CW" else "CW"
         set_direction_button(self, button, next_direction)
 
+    # ═══════════════════════════════════════════════════════════════════
+    # Step insert/duplicate/remove/move (Tier 3a, 2026-08-10): the shared
+    # ExperimentPlanTableModel has no insert_step/duplicate_step/remove_step/
+    # move_step of its own (unlike the retired lean PlanTableModel) - it
+    # owns display-relevant state via setters but the *step list itself* is
+    # pushed in whole via set_steps(), the same ownership model sLSPR acq's
+    # own window already uses. Each handler below reads the current list,
+    # mutates a plain Python copy, and pushes it back.
+    # ═══════════════════════════════════════════════════════════════════
+
     def _add_experiment_control_step_from_editor(self) -> None:
         row = self._selected_experiment_control_row()
-        insert_at = len(self._table_model.steps()) if row is None else row + 1
+        steps = self._table_model.steps()
+        insert_at = len(steps) if row is None else row + 1
         step = self._current_editor_step(insert_at + 1)
-        new_row = self._table_model.insert_step(row if row is not None else -1, step)
-        self.plan_table.selectRow(new_row)
+        steps.insert(insert_at, step)
+        self._table_model.set_steps(recompute_plan_timing(steps))
+        self.plan_table.selectRow(insert_at)
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
 
     def _on_duplicate_step_clicked(self) -> None:
         row = self._selected_experiment_control_row()
         if row is None:
             return
-        new_row = self._table_model.duplicate_step(row)
-        if new_row is not None:
-            self.plan_table.selectRow(new_row)
+        steps = self._table_model.steps()
+        if not (0 <= row < len(steps)):
+            return
+        insert_at = row + 1
+        steps.insert(insert_at, deepcopy(steps[row]))
+        self._table_model.set_steps(recompute_plan_timing(steps))
+        self.plan_table.selectRow(insert_at)
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
 
     def _on_delete_step_clicked(self) -> None:
         row = self._selected_experiment_control_row()
         if row is None or self._plan_running or self._plan_holding or self._plan_paused:
             return
-        self._table_model.remove_step(row)
+        steps = self._table_model.steps()
+        if not (0 <= row < len(steps)):
+            return
+        del steps[row]
+        self._table_model.set_steps(recompute_plan_timing(steps))
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
 
     def _on_step_move_requested(self, delta: int) -> None:
         row = self.plan_table.currentRow()
-        if row < 0:
+        steps = self._table_model.steps()
+        target = row + delta
+        if row < 0 or not (0 <= target < len(steps)):
             return
-        new_row = self._table_model.move_step(row, delta)
-        if new_row is not None:
-            self.plan_table.selectRow(new_row)
+        steps[row], steps[target] = steps[target], steps[row]
+        self._table_model.set_steps(recompute_plan_timing(steps))
+        self.plan_table.selectRow(target)
         self._sync_experiment_control_timeline(self._read_experiment_control_steps(), self._plan_active_row)
 
 

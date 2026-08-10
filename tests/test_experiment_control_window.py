@@ -103,8 +103,8 @@ class PauseTemplateEditingTests(unittest.TestCase):
 
     def test_editing_the_pause_template_table_changes_what_pause_row_step_returns(self) -> None:
         model = self.window._pause_template_model
-        model.setData(model.index(0, 2), "Open")  # valve column
-        model.setData(model.index(0, 4), "35")  # CH1 flow column
+        model.setData(model.index(0, self.window._valve_column()), "Open")
+        model.setData(model.index(0, self.window._flow_rate_column(0)), "35")
 
         pause_step = self.window._pause_row_step()
 
@@ -121,14 +121,14 @@ class PauseTemplateEditingTests(unittest.TestCase):
         # comment string instead, which starts empty on the main step, to
         # actually distinguish "isolated" from "coincidentally the same".
         model = self.window._pause_template_model
-        model.setData(model.index(0, 13), "pause-only comment")  # comment column
+        model.setData(model.index(0, self.window._description_column()), "pause-only comment")
         self.assertEqual(len(self.window._read_experiment_control_steps()), 1)
         self.assertNotEqual(self.window._read_experiment_control_steps()[0].description, "pause-only comment")
 
     def test_pause_uses_the_edited_template_when_actually_pausing(self) -> None:
         model = self.window._pause_template_model
-        model.setData(model.index(0, 2), "Open")
-        model.setData(model.index(0, 4), "42")
+        model.setData(model.index(0, self.window._valve_column()), "Open")
+        model.setData(model.index(0, self.window._flow_rate_column(0)), "42")
 
         self.window._run_experiment_control()
         _drain_device_io()
@@ -785,27 +785,38 @@ class ImportExportTests(unittest.TestCase):
 
 
 class PlanTableDelegateWiringTests(unittest.TestCase):
-    """Confirms the real plan_table/pause_template_table (not a bare
-    PlanTableModel/delegate pair) actually got the real delegates
-    installed - the delegate behavior itself is covered directly in
-    test_plan_table_model.py."""
+    """Confirms the real plan_table/pause_template_table got sLSPR acq's
+    actual 8 delegates installed (Tier 3a, 2026-08-10 - the lean
+    ValveDelegate/SwitchSolutionDelegate/DirectionDelegate this replaced,
+    and their dedicated test_plan_table_model.py, are retired)."""
 
     def setUp(self) -> None:
         self.window = _make_window(self)
 
     def test_plan_table_has_real_delegates_not_the_default_one(self) -> None:
-        from lspri_acq_app.gui.plan_table_model import COLUMN_SWITCH, COLUMN_VALVE, SwitchSolutionDelegate, ValveDelegate
+        from lspr_acq_shell.experiment_plan_table_model import ExperimentPlanSwitchDelegate, ExperimentPlanValveDelegate
 
-        self.assertIsInstance(self.window.plan_table.itemDelegateForColumn(COLUMN_VALVE), ValveDelegate)
-        self.assertIsInstance(self.window.plan_table.itemDelegateForColumn(COLUMN_SWITCH), SwitchSolutionDelegate)
+        self.assertIsInstance(
+            self.window.plan_table.itemDelegateForColumn(self.window._valve_column()), ExperimentPlanValveDelegate
+        )
+        self.assertIsInstance(
+            self.window.plan_table.itemDelegateForColumn(self.window._switch_column()), ExperimentPlanSwitchDelegate
+        )
 
     def test_pause_template_table_also_has_real_delegates(self) -> None:
-        from lspri_acq_app.gui.plan_table_model import COLUMN_VALVE, ValveDelegate
+        from lspr_acq_shell.experiment_plan_table_model import ExperimentPlanValveDelegate
 
-        self.assertIsInstance(self.window.pause_template_table.itemDelegateForColumn(COLUMN_VALVE), ValveDelegate)
+        self.assertIsInstance(
+            self.window.pause_template_table.itemDelegateForColumn(self.window._valve_column()),
+            ExperimentPlanValveDelegate,
+        )
 
-    def test_valve_delegate_display_text_reflects_a_custom_label(self) -> None:
-        from lspri_acq_app.gui.plan_table_model import COLUMN_VALVE
+    def test_valve_label_edit_updates_what_the_real_model_displays(self) -> None:
+        """Unlike the retired lean delegate (which read window._valve_state_label()
+        fresh on every paint via displayText()), the real ExperimentPlanTableModel
+        caches valve labels itself - _edit_valve_state_labels must push the
+        edit into the model (_sync_table_models_display_state) for the table
+        to actually show it."""
 
         def _exec(dialog_self):
             dialog_self.findChildren(QLineEdit)[0].setText("Loaded")
@@ -814,10 +825,8 @@ class PlanTableDelegateWiringTests(unittest.TestCase):
         with patch.object(QDialog, "exec", _exec):
             self.window._edit_valve_state_labels()
 
-        delegate = self.window.plan_table.itemDelegateForColumn(COLUMN_VALVE)
-        index = self.window._table_model.index(0, COLUMN_VALVE)
-        text = delegate.displayText(index.data(Qt.ItemDataRole.DisplayRole), None)
-        self.assertEqual(text, "Loaded")
+        index = self.window._table_model.index(0, self.window._valve_column())
+        self.assertEqual(index.data(Qt.ItemDataRole.DisplayRole), "Loaded")
 
 
 class AssignmentTableStateTests(unittest.TestCase):
