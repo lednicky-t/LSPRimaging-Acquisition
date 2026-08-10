@@ -22,6 +22,9 @@ Built from the shared pieces landed across Tiers 0-2 of that extraction:
   `experiment_control_table` - the *real* `ExperimentPlanTableModel` + its 8
   delegates, and the functions that wire them onto a `QTableView`
   (Tier 3a, 2026-08-10 - see below).
+- `lspr_acq_shell.experiment_control_theme` - the real palette +
+  stylesheet template (Tier 3b, 2026-08-10) - `_theme_palette`/`_apply_style`
+  below are thin wrappers, not a ported copy.
 
 **Tier 3a migration (2026-08-10)**: this window used to have its own lean
 `gui.plan_table_model.PlanTableModel` (plain Qt text/combo editing) plus 3
@@ -208,6 +211,7 @@ from lspr_acq_shell.experiment_control_import import (
 from lspr_acq_shell.experiment_control_run_loop import PlanRunLoopMixin
 from lspr_acq_shell.experiment_control_step_decision import StepCommandContext, plan_step_commands
 from lspr_acq_shell.experiment_control_step_runner import _StepApplyResult, _StepApplyRunnable
+from lspr_acq_shell.experiment_control_theme import apply_experiment_control_style, experiment_control_theme_palette
 from lspr_acq_shell.experiment_control_timeline import PumpPlanTimelineWidget
 from lspr_acq_shell.experiment_control_widgets import ExperimentControlTableView, TubeDiameterComboBox
 from lspr_acq_shell.experiment_control_plan_view import (
@@ -617,168 +621,17 @@ class ExperimentControlWindow(PlanRunLoopMixin, QWidget):
         return button
 
     def _theme_palette(self) -> dict[str, str]:
-        # Same dark palette as sLSPR acq's ExperimentControlWindow._theme_palette
-        # (that method forces dark mode currently, so only the dark dict is
-        # ported here - see this window's _theme_mode assignment).
-        return {
-            "bg": "#13161b",
-            "fg": "#e6ebf1",
-            "muted": "#a8b0ba",
-            "field": "#171b21",
-            "button": "#20252d",
-            "button_hover": "#272d36",
-            "button_pressed": "#303640",
-            "accent_button": "#5d6876",
-            "accent_hover": "#707d8c",
-            "title": "#8fbaff",
-            "danger_button": "#8f5a61",
-            "danger_hover": "#a46a72",
-            "border": "#2b3138",
-            "border_hover": "#414852",
-            "pressed": "#252b33",
-            "scroll": "#49505a",
-            "scroll_hover": "#5c6470",
-            "splitter": "#2b3138",
-            "timeline_bg": "#0f1216",
-            "header": "#1b2026",
-            "selection": "#252b33",
-        }
+        # Shared with sLSPR acq (Tier 3b, 2026-08-10) - _theme_mode is still
+        # hardcoded to "dark" here (no light-mode UI toggle built yet), but
+        # experiment_control_theme_palette() supports both.
+        return experiment_control_theme_palette(self._theme_mode)
 
     def _apply_style(self) -> None:
-        # Ported verbatim from sLSPR acq's ExperimentControlWindow._apply_style
-        # (object names below match sLSPR acq's exactly: flowIconButton,
-        # flowStepActionButton, flowControlTable) so this app's panel picks
-        # up the identical stylesheet rules.
-        palette = self._theme_palette()
-        self.setStyleSheet(
-            """
-            QWidget {
-                background: %(bg)s;
-                color: %(fg)s;
-                font-size: 12px;
-            }
-            QToolTip {
-                background-color: %(bg)s;
-                color: %(fg)s;
-                border: 1px solid %(border)s;
-                padding: 4px 6px;
-            }
-            QPushButton, QToolButton, QComboBox, QDoubleSpinBox, QLineEdit, QTableWidget {
-                background: %(field)s;
-                border: 1px solid %(border)s;
-                border-radius: 10px;
-                padding: 4px 6px;
-            }
-            QSpinBox, QDoubleSpinBox {
-                border-radius: 3px;
-                padding: 1px 4px;
-            }
-            QSpinBox::up-button, QSpinBox::down-button,
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                width: 0px;
-                border: none;
-                background: transparent;
-            }
-            QSpinBox::up-arrow, QSpinBox::down-arrow,
-            QDoubleSpinBox::up-arrow, QDoubleSpinBox::down-arrow {
-                width: 0px;
-                height: 0px;
-            }
-            QPushButton:hover, QToolButton:hover, QComboBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {
-                border-color: %(border_hover)s;
-                background: %(button_hover)s;
-            }
-            QPushButton:pressed, QToolButton:pressed {
-                background: %(button_pressed)s;
-            }
-            QToolButton#flowIconButton {
-                background: transparent;
-                border: none;
-                padding: 0px;
-            }
-            QToolButton#flowIconButton:hover {
-                background: rgba(127, 127, 127, 0.10);
-                border: none;
-            }
-            QToolButton#flowIconButton:pressed {
-                background: rgba(127, 127, 127, 0.18);
-                border: none;
-            }
-            QToolButton#flowIconButton:checked {
-                background: rgba(102, 167, 255, 0.18);
-                border: none;
-            }
-            QWidget#flowContent, QWidget#flowEditorContainer {
-                background: %(bg)s;
-                border: none;
-            }
-            QTableView#flowControlTable {
-                background: %(bg)s;
-                border: none;
-                border-radius: 0px;
-                gridline-color: %(border)s;
-                alternate-background-color: %(button)s;
-                selection-background-color: transparent;
-                selection-color: %(fg)s;
-                font-size: 11px;
-            }
-            QTableView#flowControlTable::viewport {
-                background: %(bg)s;
-                border: none;
-            }
-            QTableView#flowControlTable::item {
-                border: none;
-                padding: 1px 4px;
-            }
-            QTableView#flowControlTable QComboBox,
-            QTableView#flowControlTable QDoubleSpinBox,
-            QTableView#flowControlTable QLineEdit,
-            QTableView#flowControlTable QToolButton {
-                background: transparent;
-                border: none;
-                padding: 0px 1px;
-                margin: 0px;
-            }
-            QTableView#flowControlTable::item:selected {
-                background: transparent;
-                background-color: transparent;
-            }
-            QTableView#flowControlTable::item:selected:active,
-            QTableView#flowControlTable::item:selected:!active {
-                background: transparent;
-                background-color: transparent;
-            }
-            QTableView#flowControlTable QHeaderView::section {
-                background: %(header)s;
-                border: none;
-                border-right: 1px solid %(border)s;
-                border-bottom: 1px solid %(border)s;
-                padding: 0px 1px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 8px;
-            }
-            QScrollBar::handle:vertical {
-                background: %(scroll)s;
-                border-radius: 4px;
-                min-height: 30px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: %(scroll_hover)s;
-            }
-            QSplitter::handle {
-                background: %(splitter)s;
-            }
-            QSplitter::handle:vertical {
-                height: 6px;
-                margin: 0 4px;
-                border-radius: 3px;
-            }
-            """ % palette
-        )
+        # Shared with sLSPR acq (Tier 3b, 2026-08-10) - one real stylesheet
+        # template, not two independently-drifting copies (see
+        # experiment_control_theme.py's module docstring for why this
+        # mattered: a real bug earlier this session came from exactly that).
+        apply_experiment_control_style(self, self._theme_palette())
 
     def _build_native_experiment_plan_document(self) -> dict[str, object]:
         """Native YAML export schema - matches sLSPR acq's
